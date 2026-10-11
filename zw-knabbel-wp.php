@@ -43,6 +43,7 @@ require_once KNABBEL_PLUGIN_DIR . 'includes/story-status.php';
 require_once KNABBEL_PLUGIN_DIR . 'includes/weekdays.php';
 require_once KNABBEL_PLUGIN_DIR . 'includes/babbel-api.php';
 require_once KNABBEL_PLUGIN_DIR . 'includes/ai-handler.php';
+require_once KNABBEL_PLUGIN_DIR . 'includes/speech-text.php';
 require_once KNABBEL_PLUGIN_DIR . 'includes/few-shot-selection.php';
 require_once KNABBEL_PLUGIN_DIR . 'includes/few-shot-cache.php';
 

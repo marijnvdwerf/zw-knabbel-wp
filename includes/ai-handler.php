@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // phpcs:disable Generic.Files.LineLength.TooLong -- Keep the reviewed prompt prose intact.
 const AI_DEFAULT_INSTRUCTION = <<<'PROMPT'
-Je bent radio-eindredacteur van ZuidWest FM, de radiozender van Streekomroep ZuidWest. De zender is actief in Roosendaal, Bergen op Zoom, Etten-Leur, Woensdrecht, Moerdijk, Halderberge, Steenbergen, Tholen, Rucphen en Zundert. Gebruik dit alleen als regionale context. Het is 2026.
+Je bent radio-eindredacteur van ZuidWest FM, de radiozender van Streekomroep ZuidWest. De zender is actief in Roosendaal, Bergen op Zoom, Etten-Leur, Woensdrecht, Moerdijk, Halderberge, Steenbergen, Tholen, Rucphen en Zundert. Gebruik dit alleen als regionale context. Het is {year}.
 
 Maak van het artikel een zelfstandig en natuurlijk radiobericht. Hanteer bij spanning tussen regels deze volgorde: brongetrouwheid, nieuwswaarde, natuurlijke spreektaal en daarna vorm.
 
@@ -59,6 +59,17 @@ PROMPT;
 const AI_ARTICLE_PROMPT = "Artikel:\n\"\"\"\n%s\n\"\"\"";
 const AI_EXAMPLE_PROMPT = '%s — leer van toon, nieuwsselectie en formulering. Neem geen feiten over. '
 	. 'De lengte en het zinsaantal kunnen afwijken van de instructie voor het nieuwe artikel.';
+
+/**
+ * Returns the default instruction for the current year.
+ *
+ * @since 0.9.0
+ * @param int|null $timestamp Unix timestamp to take the year from, or null for now.
+ * @return string Default instruction with the year in the site timezone.
+ */
+function ai_default_instruction( ?int $timestamp = null ): string {
+	return str_replace( '{year}', (string) wp_date( 'Y', $timestamp ), AI_DEFAULT_INSTRUCTION );
+}
 
 /**
  * Returns configured text-generation models.
@@ -122,6 +133,7 @@ function ai_parse_model_setting( mixed $value ): ?array {
  * @since 0.5.0
  * @since 0.7.0 Added the `$current_post_id` parameter and curated example mix.
  * @since 0.8.0 Omits the temperature parameter and rebuilds the prompt per attempt.
+ * @since 0.9.0 Retries output that breaks the default prompt's form rules.
  * @param string $content         The source content.
  * @param int    $current_post_id Current post ID to exclude from examples, 0 for none.
  * @return string|null The generated content or null on failure.
@@ -129,7 +141,9 @@ function ai_parse_model_setting( mixed $value ): ?array {
 function ai_generate_content( string $content, int $current_post_id ): ?string {
 	$options       = get_plugin_settings();
 	$speech_prompt = (string) $options['speech_prompt'];
-	$instruction   = '' !== trim( $speech_prompt ) ? $speech_prompt : AI_DEFAULT_INSTRUCTION;
+	// A custom prompt may set its own form rules, so only the default prompt is checked.
+	$uses_default = '' === trim( $speech_prompt );
+	$instruction  = $uses_default ? ai_default_instruction() : $speech_prompt;
 
 	$messages = array();
 	foreach ( get_few_shot_examples( $current_post_id ) as $example ) {
@@ -158,7 +172,8 @@ function ai_generate_content( string $content, int $current_post_id ): ?string {
 		return null;
 	}
 
-	$max_attempts = 3;
+	$max_attempts  = 3;
+	$nonconforming = null;
 	for ( $attempt = 1; $attempt <= $max_attempts; ++$attempt ) {
 		$result = $build_prompt()->generate_text();
 
@@ -174,11 +189,26 @@ function ai_generate_content( string $content, int $current_post_id ): ?string {
 			);
 		} else {
 			$result = trim( $result );
-			if ( '' !== $result ) {
-				log( 'info', 'AiHandler', 'Speech text generated successfully', array( 'content_length' => strlen( $result ) ) );
-				return $result;
+			if ( '' === $result ) {
+				log( 'error', 'AiHandler', 'WordPress AI Client returned empty speech text' );
+			} else {
+				$violation = $uses_default ? default_speech_text_violation( $result ) : null;
+				if ( null === $violation ) {
+					log( 'info', 'AiHandler', 'Speech text generated successfully', array( 'content_length' => strlen( $result ) ) );
+					return $result;
+				}
+
+				$nonconforming = $result;
+				log(
+					'warning',
+					'AiHandler',
+					'Speech text breaks the default prompt form rules',
+					array(
+						'error'   => $violation,
+						'attempt' => $attempt,
+					)
+				);
 			}
-			log( 'error', 'AiHandler', 'WordPress AI Client returned empty speech text' );
 		}
 
 		if ( $attempt < $max_attempts ) {
@@ -186,6 +216,17 @@ function ai_generate_content( string $content, int $current_post_id ): ?string {
 			log( 'info', 'AiHandler', "Retry attempt {$attempt}/{$max_attempts} after {$delay}s delay" );
 			sleep( $delay );
 		}
+	}
+
+	// A text that breaks the form rules can still be edited in Babbel; no text blocks the story entirely.
+	if ( null !== $nonconforming ) {
+		log(
+			'error',
+			'AiHandler',
+			'No attempt met the default prompt form rules; using the last generated text',
+			array( 'error' => default_speech_text_violation( $nonconforming ) )
+		);
+		return $nonconforming;
 	}
 
 	log( 'error', 'AiHandler', "All {$max_attempts} retry attempts failed" );

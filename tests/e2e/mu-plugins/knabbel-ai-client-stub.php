@@ -50,6 +50,14 @@ add_filter(
 				return new WP_Error( 'knabbel_e2e_ai_error', 'Deterministic AI provider failure' );
 			}
 
+			// Queued outputs are answered in order before the default text.
+			$queued_outputs = get_option( 'knabbel_e2e_ai_outputs', array() );
+			$text           = 'Deterministische E2E-radiospreektekst.'; // Keep in sync with suite.php and editor-flow.spec.ts.
+			if ( is_array( $queued_outputs ) && array() !== $queued_outputs ) {
+				$text = (string) array_shift( $queued_outputs );
+				update_option( 'knabbel_e2e_ai_outputs', $queued_outputs, false );
+			}
+
 			$body = array(
 				'output' => array(
 					array(
@@ -57,8 +65,7 @@ add_filter(
 						'content' => array(
 							array(
 								'type' => 'output_text',
-								// Keep in sync with suite.php and editor-flow.spec.ts.
-								'text' => 'Deterministische E2E-radiospreektekst.',
+								'text' => $text,
 							),
 						),
 					),

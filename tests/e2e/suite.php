@@ -87,7 +87,8 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-017', 'delete and restore failures remain retryable', $this->test_delete_and_restore_failures( ... ) );
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
 		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
-		$this->run_case( 'E2E-020', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-020', 'default prompt carries the site year and retries nonconforming output', $this->test_default_prompt_constraints( ... ) );
+		$this->run_case( 'E2E-021', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -844,6 +845,84 @@ final class Knabbel_E2E_Suite {
 			'update',
 			'API error: HTTP 410 - Story with id ' . $story_id . ' has been deleted'
 		);
+	}
+
+	/**
+	 * Verifies the default prompt's year and form rules.
+	 */
+	private function test_default_prompt_constraints(): void {
+		$timezone = get_option( 'timezone_string' );
+		// 31 December 2026 11:00 UTC is already 2027 at UTC+14 and still 2026 at UTC-11.
+		$timestamp = gmmktime( 11, 0, 0, 12, 31, 2026 );
+		try {
+			update_option( 'timezone_string', 'Pacific/Kiritimati' );
+			$this->assert_same(
+				true,
+				str_contains( KnabbelWP\ai_default_instruction( $timestamp ), 'Het is 2027.' ),
+				'The year must follow the site timezone ahead of UTC.'
+			);
+			update_option( 'timezone_string', 'Pacific/Pago_Pago' );
+			$this->assert_same(
+				true,
+				str_contains( KnabbelWP\ai_default_instruction( $timestamp ), 'Het is 2026.' ),
+				'The year must follow the site timezone behind UTC.'
+			);
+		} finally {
+			update_option( 'timezone_string', $timezone );
+		}
+		$this->assert_same( false, str_contains( KnabbelWP\ai_default_instruction(), '{year}' ), 'The year placeholder must always be replaced.' );
+
+		$too_long   = implode( ' ', array_fill( 0, 66, 'woord' ) ) . '.';
+		$paragraphs = "Eerste alinea van het bericht.\n\nTweede alinea van het bericht.";
+		$valid      = 'Een geldige radiotekst van één alinea.';
+
+		update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $paragraphs, $valid ), false );
+		update_option( 'knabbel_e2e_ai_call_count', 0, false );
+		$this->assert_same(
+			$valid,
+			KnabbelWP\ai_generate_content( 'Een artikel voor de standaardprompt.', 0 ),
+			'Nonconforming default output must be retried.'
+		);
+		$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Each nonconforming output must cost one attempt.' );
+		$request_json = (string) wp_json_encode( get_option( 'knabbel_e2e_ai_last_request', array() ) );
+		$this->assert_same(
+			true,
+			str_contains( $request_json, 'Het is ' . wp_date( 'Y' ) . '.' ),
+			'The AI request must carry the current year in the site timezone.'
+		);
+
+		update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $too_long, $paragraphs ), false );
+		update_option( 'knabbel_e2e_ai_call_count', 0, false );
+		$this->assert_same(
+			$paragraphs,
+			KnabbelWP\ai_generate_content( 'Een artikel zonder geldige uitvoer.', 0 ),
+			'When no attempt conforms, the last generated text must be used.'
+		);
+		$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Nonconforming output must not exceed the retry limit.' );
+		$recent_errors = (string) wp_json_encode( get_option( 'knabbel_recent_errors', array() ) );
+		$this->assert_same(
+			true,
+			str_contains( $recent_errors, 'Text contains more than one paragraph' ),
+			'Using a nonconforming text must record the reason in recent errors.'
+		);
+
+		$settings                  = get_option( 'knabbel_settings', array() );
+		$settings['speech_prompt'] = 'Schrijf een uitgebreid radiobericht in meerdere alinea\'s.';
+		update_option( 'knabbel_settings', $settings );
+		update_option( 'knabbel_e2e_ai_outputs', array( $too_long ), false );
+		update_option( 'knabbel_e2e_ai_call_count', 0, false );
+		try {
+			$this->assert_same(
+				$too_long,
+				KnabbelWP\ai_generate_content( 'Een artikel voor een eigen prompt.', 0 ),
+				'A custom prompt must not get the default limits.'
+			);
+			$this->assert_same( 1, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'A custom prompt must accept the first output.' );
+		} finally {
+			$settings['speech_prompt'] = '';
+			update_option( 'knabbel_settings', $settings );
+			delete_option( 'knabbel_e2e_ai_outputs' );
+		}
 	}
 
 	/**

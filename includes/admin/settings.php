@@ -445,7 +445,7 @@ function render_ai_card( array $settings ): void {
 					name="knabbel_settings[speech_prompt]"
 					class="knabbel-field-input"
 					rows="4"
-					placeholder="<?php echo esc_attr( AI_DEFAULT_INSTRUCTION ); ?>"><?php echo esc_textarea( $settings['speech_prompt'] ); ?></textarea>
+					placeholder="<?php echo esc_attr( ai_default_instruction() ); ?>"><?php echo esc_textarea( $settings['speech_prompt'] ); ?></textarea>
 				<p class="knabbel-field-description">
 					<?php esc_html_e( 'Prompt for converting to radio-friendly speech text. Leave empty for default prompt.', 'zw-knabbel-wp' ); ?>
 				</p>

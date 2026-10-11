@@ -37,6 +37,9 @@
   },
   "scripts": {
     "phpstan": "@php -d memory_limit=2G vendor/bin/phpstan analyse --no-progress",
-    "test": "@php -r \"define('ABSPATH', getcwd() . '/'); require 'tests/php/few-shot-selection.php';\""
+    "test": [
+      "@php -r \"define('ABSPATH', getcwd() . '/'); require 'tests/php/few-shot-selection.php';\"",
+      "@php -r \"define('ABSPATH', getcwd() . '/'); require 'tests/php/speech-text.php';\""
+    ]
   }
 }
