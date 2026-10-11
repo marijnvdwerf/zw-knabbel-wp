@@ -463,8 +463,8 @@ function init(): void {
 	// Register cron hook for async story processing (always, not just admin).
 	add_action( 'knabbel_process_story', __NAMESPACE__ . '\\process_story_async', 10, 1 );
 
-	// Sessions are cached per URL and username only, so saved credentials invalidate them.
-	add_action( 'update_option_knabbel_settings', __NAMESPACE__ . '\\babbel_clear_replaced_sessions', 10, 2 );
+	// Drop the session of replaced credentials right away instead of at the next login.
+	add_action( 'update_option_knabbel_settings', __NAMESPACE__ . '\\babbel_clear_session_cache', 10, 0 );
 
 	// Register few-shot example sync hook and ensure it is scheduled.
 	// Schedule check runs on every init because activation hooks do not fire on plugin updates.
@@ -560,7 +560,7 @@ function activate(): void {
  * @since 0.1.0
  */
 function deactivate(): void {
-	babbel_cleanup_sessions();
+	babbel_clear_session_cache();
 
 	// Clear Action Scheduler jobs. Hook-only takes the bulk-cancel path; passing
 	// args or a group forces an exact args match and would skip per-post actions.
