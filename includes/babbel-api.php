@@ -16,6 +16,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+// One cached session record for the configured credentials, stored with their fingerprint.
+const KNABBEL_SESSION_TRANSIENT = 'knabbel_session';
+
 /**
  * Returns the configured Babbel API credentials.
  *
@@ -34,20 +37,6 @@ function babbel_get_credentials(): array {
 }
 
 /**
- * Builds the session transient key.
- *
- * @since 0.5.0
- * @param array{base_url: string, username: string, password: string}|null $credentials Optional credential snapshot.
- * @return string Transient key.
- *
- * @phpstan-param BabbelCredentials|null $credentials
- */
-function babbel_get_session_cache_key( ?array $credentials = null ): string {
-	$credentials ??= babbel_get_credentials();
-	return 'knabbel_session_' . md5( $credentials['base_url'] . $credentials['username'] );
-}
-
-/**
  * Returns cached or newly created session cookies.
  *
  * @since 0.1.0
@@ -60,11 +49,18 @@ function babbel_get_session_cookies(): array|\WP_Error {
 		return new \WP_Error( 'missing_credentials', __( 'Username and password are required', 'zw-knabbel-wp' ) );
 	}
 
-	$cache_key      = babbel_get_session_cache_key( $credentials );
-	$cached_cookies = get_transient( $cache_key );
+	// A keyed hash, so a cached session is never reused for other credentials.
+	$fingerprint = wp_hash( implode( "\n", $credentials ), 'auth', 'sha256' );
+	$session     = get_transient( KNABBEL_SESSION_TRANSIENT );
 
-	if ( $cached_cookies && is_array( $cached_cookies ) ) {
-		return $cached_cookies;
+	if (
+		is_array( $session )
+		&& is_string( $session['fingerprint'] ?? null )
+		&& hash_equals( $fingerprint, $session['fingerprint'] )
+		&& is_array( $session['cookies'] ?? null )
+		&& array() !== $session['cookies']
+	) {
+		return $session['cookies'];
 	}
 
 	// Create fresh session.
@@ -100,7 +96,14 @@ function babbel_get_session_cookies(): array|\WP_Error {
 		}
 
 		// Babbel sessions last 24 hours; renew an hour early. A 401 still forces a new login.
-		set_transient( $cache_key, $cookies, DAY_IN_SECONDS - HOUR_IN_SECONDS );
+		set_transient(
+			KNABBEL_SESSION_TRANSIENT,
+			array(
+				'fingerprint' => $fingerprint,
+				'cookies'     => $cookies,
+			),
+			DAY_IN_SECONDS - HOUR_IN_SECONDS
+		);
 
 		return $cookies;
 }
@@ -108,10 +111,12 @@ function babbel_get_session_cookies(): array|\WP_Error {
 /**
  * Clears cached session cookies.
  *
+ * Needs only this file, so uninstall.php can call it.
+ *
  * @since 0.1.0
  */
 function babbel_clear_session_cache(): void {
-	delete_transient( babbel_get_session_cache_key() );
+	delete_transient( KNABBEL_SESSION_TRANSIENT );
 }
 
 /**
@@ -766,27 +771,4 @@ function babbel_fetch_recent_stories( string $created_after ): array|\WP_Error {
 	);
 
 	return $stories;
-}
-
-/**
- * Removes cached Babbel sessions.
- *
- * @since 0.1.0
- *
- * @global wpdb $wpdb WordPress database abstraction object.
- */
-function babbel_cleanup_sessions(): void {
-	global $wpdb;
-
-	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- No cached core API supports prefix transient lookup.
-	$option_names = $wpdb->get_col(
-		$wpdb->prepare(
-			'SELECT option_name FROM ' . $wpdb->options . ' WHERE option_name LIKE %s',
-			$wpdb->esc_like( '_transient_knabbel_session_' ) . '%'
-		)
-	);
-
-	foreach ( $option_names as $option_name ) {
-		delete_transient( substr( (string) $option_name, strlen( '_transient_' ) ) );
-	}
 }

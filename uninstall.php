@@ -14,9 +14,9 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 	exit;
 }
 
-// Clean up transients (session cache).
+// Clean up the session cache.
 require_once __DIR__ . '/includes/babbel-api.php';
-KnabbelWP\babbel_cleanup_sessions();
+KnabbelWP\babbel_clear_session_cache();
 
 // Clean up temporary options.
 delete_option( 'knabbel_recent_errors' );
