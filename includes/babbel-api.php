@@ -19,17 +19,22 @@ if ( ! defined( 'ABSPATH' ) ) {
 /**
  * Returns the configured Babbel API credentials.
  *
+ * Reads the option directly, so uninstall.php can use it without the main
+ * plugin file. Credential defaults are empty strings.
+ *
  * @since 0.1.0
+ * @since 0.8.0 Added the `$settings` parameter.
+ * @param array<string, mixed>|null $settings Optional knabbel_settings value; defaults to the stored option.
  * @return array{base_url: string, username: string, password: string} Array with base_url, username, and password.
  *
  * @phpstan-return BabbelCredentials
  */
-function babbel_get_credentials(): array {
-	$options = get_plugin_settings();
+function babbel_get_credentials( ?array $settings = null ): array {
+	$settings ??= (array) get_option( 'knabbel_settings', array() );
 	return array(
-		'base_url' => rtrim( (string) $options['api_base_url'], '/' ),
-		'username' => (string) $options['api_username'],
-		'password' => (string) $options['api_password'],
+		'base_url' => rtrim( (string) ( $settings['api_base_url'] ?? '' ), '/' ),
+		'username' => (string) ( $settings['api_username'] ?? '' ),
+		'password' => (string) ( $settings['api_password'] ?? '' ),
 	);
 }
 
@@ -112,6 +117,23 @@ function babbel_get_session_cookies(): array|\WP_Error {
  */
 function babbel_clear_session_cache(): void {
 	delete_transient( babbel_get_session_cache_key() );
+}
+
+/**
+ * Clears sessions cached for the previous and the saved credentials.
+ *
+ * The session key covers the URL and username only. Clearing both keys makes
+ * a saved password take effect and leaves no session behind for replaced
+ * credentials.
+ *
+ * @since 0.8.0
+ * @param mixed $old_value Previous knabbel_settings value.
+ * @param mixed $value     Saved knabbel_settings value.
+ */
+function babbel_clear_replaced_sessions( mixed $old_value, mixed $value ): void {
+	foreach ( array( $old_value, $value ) as $settings ) {
+		delete_transient( babbel_get_session_cache_key( babbel_get_credentials( (array) $settings ) ) );
+	}
 }
 
 /**
@@ -772,12 +794,17 @@ function babbel_fetch_recent_stories( string $created_after ): array|\WP_Error {
  * Removes cached Babbel sessions.
  *
  * @since 0.1.0
+ * @since 0.8.0 Also clears the current session from a persistent object cache.
  *
  * @global wpdb $wpdb WordPress database abstraction object.
  */
 function babbel_cleanup_sessions(): void {
 	global $wpdb;
 
+	// A persistent object cache keeps transients out of the options table.
+	babbel_clear_session_cache();
+
+	// Sweep database-stored sessions left for replaced credentials, e.g. by earlier versions.
 	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- No cached core API supports prefix transient lookup.
 	$option_names = $wpdb->get_col(
 		$wpdb->prepare(

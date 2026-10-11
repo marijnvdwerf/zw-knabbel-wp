@@ -464,7 +464,7 @@ function init(): void {
 	add_action( 'knabbel_process_story', __NAMESPACE__ . '\\process_story_async', 10, 1 );
 
 	// Sessions are cached per URL and username only, so saved credentials invalidate them.
-	add_action( 'update_option_knabbel_settings', __NAMESPACE__ . '\\babbel_clear_session_cache', 10, 0 );
+	add_action( 'update_option_knabbel_settings', __NAMESPACE__ . '\\babbel_clear_replaced_sessions', 10, 2 );
 
 	// Register few-shot example sync hook and ensure it is scheduled.
 	// Schedule check runs on every init because activation hooks do not fire on plugin updates.

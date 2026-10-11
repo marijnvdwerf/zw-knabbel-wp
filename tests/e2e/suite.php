@@ -87,7 +87,8 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-017', 'delete and restore failures remain retryable', $this->test_delete_and_restore_failures( ... ) );
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
 		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
-		$this->run_case( 'E2E-020', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-020', 'sessions are cleared from a persistent object cache', $this->test_session_cleanup_with_object_cache( ... ) );
+		$this->run_case( 'E2E-021', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -847,6 +848,35 @@ final class Knabbel_E2E_Suite {
 			'update',
 			'API error: HTTP 410 - Story with id ' . $story_id . ' has been deleted'
 		);
+	}
+
+	/**
+	 * Verifies session cleanup when transients bypass the options table.
+	 *
+	 * Inside this single process, an external object cache keeps transients in
+	 * the runtime cache only, as Redis or Memcached would.
+	 */
+	private function test_session_cleanup_with_object_cache(): void {
+		$this->configure_plugin();
+		$cache_key = KnabbelWP\babbel_get_session_cache_key();
+		// Remove the database copy so only the object cache can hold the session.
+		delete_transient( $cache_key );
+
+		$was_external = wp_using_ext_object_cache( true );
+		try {
+			$this->assert_same( true, is_array( KnabbelWP\babbel_get_session_cookies() ), 'Precondition: login must cache a session.' );
+			$settings                 = get_option( 'knabbel_settings', array() );
+			$settings['api_username'] = 'e2e-replaced-user';
+			update_option( 'knabbel_settings', $settings );
+			$this->assert_same( false, get_transient( $cache_key ), 'Replacing the username must clear the previous session.' );
+
+			$this->configure_plugin();
+			$this->assert_same( true, is_array( KnabbelWP\babbel_get_session_cookies() ), 'Precondition: login must cache a new session.' );
+			KnabbelWP\babbel_cleanup_sessions();
+			$this->assert_same( false, get_transient( $cache_key ), 'Session cleanup must reach the object cache.' );
+		} finally {
+			wp_using_ext_object_cache( $was_external );
+		}
 	}
 
 	/**
