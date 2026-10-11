@@ -40,6 +40,7 @@ function babbel_get_credentials(): array {
  * Returns cached or newly created session cookies.
  *
  * @since 0.1.0
+ * @since 0.8.0 Caches a single fingerprinted session for 23 hours.
  * @return array<int, \WP_Http_Cookie>|\WP_Error Session cookies array or WP_Error on failure.
  */
 function babbel_get_session_cookies(): array|\WP_Error {
@@ -114,6 +115,7 @@ function babbel_get_session_cookies(): array|\WP_Error {
  * Needs only this file, so uninstall.php can call it.
  *
  * @since 0.1.0
+ * @since 0.8.0 Clears the single fingerprinted session.
  */
 function babbel_clear_session_cache(): void {
 	delete_transient( KNABBEL_SESSION_TRANSIENT );
@@ -206,6 +208,7 @@ function babbel_make_authenticated_request( string $url, array $args = array() )
  * Creates a story through the Babbel API.
  *
  * @since 0.1.0
+ * @since 0.8.0 Reports Problem Details errors and requires an integer story ID.
  * @param array<string, mixed> $story_data The story data to send.
  * @return array{success: bool, message: string, story_id?: string} Response with success status and message.
  *
@@ -349,6 +352,7 @@ function babbel_create_story( array $story_data ): array {
  * Authenticates and then verifies session by fetching current user info.
  *
  * @since 0.1.0
+ * @since 0.8.0 Reports Problem Details errors and validates the returned username.
  * @return array{success: bool, message: string} Response with success status and message.
  */
 function babbel_test_connection(): array {
@@ -409,6 +413,7 @@ function babbel_test_connection(): array {
  * Updates an existing Babbel story.
  *
  * @since 0.2.0
+ * @since 0.8.0 Reports Problem Details errors.
  * @param string                                                                        $story_id   The Babbel story ID.
  * @param array{title?: string, start_date?: string, end_date?: string, weekdays?: int} $story_data The story data to update.
  * @return array{success: bool, message: string} Response with success status and message.
@@ -509,6 +514,7 @@ function babbel_update_story( string $story_id, array $story_data ): array {
  * Soft-deletes a Babbel story.
  *
  * @since 0.2.0
+ * @since 0.8.0 Accepts only HTTP 204 and reports Problem Details errors.
  * @param string $story_id The Babbel story ID.
  * @return array{success: bool, message: string} Response with success status and message.
  *
@@ -586,6 +592,7 @@ function babbel_delete_story( string $story_id ): array {
  * To update the title after restore, use babbel_update_story() separately.
  *
  * @since 0.2.0
+ * @since 0.8.0 Reports Problem Details errors.
  * @param string $story_id The Babbel story ID.
  * @return array{success: bool, message: string} Response with success status and message.
  *
@@ -684,6 +691,7 @@ function babbel_restore_story( string $story_id ): array {
  *
  * @since 0.3.0
  * @since 0.7.0 Replaced the `$limit` parameter with `$created_after` and added response validation.
+ * @since 0.8.0 Encodes query values and reports Problem Details errors.
  * @param string $created_after Inclusive RFC 3339 creation cutoff.
  * @return array<int, array<string, mixed>>|\WP_Error Array of story objects or WP_Error on failure.
  */

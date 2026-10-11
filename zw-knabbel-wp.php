@@ -3,7 +3,7 @@
  * Plugin Name: ZuidWest Knabbel
  * Plugin URI: https://github.com/oszuidwest/zw-knabbel-wp
  * Description: WordPress plugin om berichten naar de Babbel API te sturen voor het radionieuws. Gebruikt de WordPress AI Client voor AI-gegenereerde content.
- * Version: 0.7.0
+ * Version: 0.8.0
  * Requires at least: 7.0
  * Requires PHP: 8.3
  * Requires Plugins: classic-editor
@@ -375,6 +375,7 @@ function build_story_sync_error( string $message, string $operation ): array {
  * Returns a valid sync error from story state.
  *
  * @since 0.5.0
+ * @since 0.8.0 Returns null for a blank message.
  * @param array<string, mixed> $state Story state data.
  * @return array{message: string, occurred_at: string, operation: string}|null Sync error, or null when absent, malformed, or blank.
  *
@@ -405,7 +406,7 @@ function get_story_sync_error( array $state ): ?array {
  * Accepts a local-time MySQL string as written by current_time( 'mysql' ), or a
  * Unix timestamp. Falls back to the raw input when it cannot be parsed.
  *
- * @since 0.7.0
+ * @since 0.8.0
  * @param int|string $datetime Stored local-time string or Unix timestamp.
  * @return string Localized date and time in the site's display format.
  */
@@ -450,6 +451,7 @@ function calculate_story_dates( string $base_date = 'now' ): array {
  * Loads translations and registers plugin hooks.
  *
  * @since 0.1.0
+ * @since 0.8.0 Runs legacy cleanup only when the installed version changes.
  */
 function init(): void {
 	load_plugin_textdomain( 'zw-knabbel-wp', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
@@ -543,6 +545,7 @@ function get_plugin_settings(): array {
  * Initializes settings and scheduled work on activation.
  *
  * @since 0.1.0
+ * @since 0.8.0 Leaves legacy cleanup to the version gate in init().
  */
 function activate(): void {
 		// Explicitly set autoload to true since these settings are needed on every admin page load.
@@ -578,6 +581,7 @@ function deactivate(): void {
  *
  * @since 0.1.0
  * @since 0.7.0 Removes the obsolete `few_shot_count` setting.
+ * @since 0.8.0 Runs when the installed version changes instead of on every request.
  */
 function cleanup_legacy_data(): void {
 	// Raw read on purpose: this rewrites the stored value, and reading through
@@ -619,6 +623,7 @@ function ajax_test_api(): void {
  *
  * @since 0.1.0
  * @since 0.7.0 Excludes the current post from the AI few-shot examples.
+ * @since 0.8.0 Accepts only a post ID and leaves already sent stories untouched.
  * @param int $post_id The WordPress post ID.
  */
 function process_story_async( int $post_id ): void {

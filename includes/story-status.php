@@ -32,7 +32,7 @@ enum StoryStatus: string {
 	/**
 	 * Returns the translated display label.
 	 *
-	 * @since 0.7.0
+	 * @since 0.8.0
 	 * @return string Human-readable status label.
 	 */
 	public function label(): string {
