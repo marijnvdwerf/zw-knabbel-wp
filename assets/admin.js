@@ -18,7 +18,7 @@
             button.disabled = true;
             button.textContent = knabbel_admin.testing_text;
             result.className = 'knabbel-test-result';
-            result.innerHTML = '';
+            result.textContent = '';
 
             const formData = new FormData();
             formData.append('action', 'knabbel_test_api');
@@ -35,11 +35,13 @@
                     ? '<svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"/></svg>'
                     : '<svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"/></svg>';
                 result.className = `knabbel-test-result ${statusClass}`;
-                result.innerHTML = `${icon} ${data.data}`;
+                // The message can contain an upstream response body; never parse it as HTML.
+                result.innerHTML = icon;
+                result.append(` ${data.data}`);
             } catch (error) {
                 console.error('Knabbel API test failed:', error);
                 result.className = 'knabbel-test-result error';
-                result.innerHTML = knabbel_admin.error_text;
+                result.textContent = knabbel_admin.error_text;
             } finally {
                 button.disabled = false;
                 button.textContent = knabbel_admin.button_text;

@@ -378,7 +378,7 @@ function render_babbel_api_card( array $settings ): void {
 				<button type="button" id="test-babbel-api" class="knabbel-btn knabbel-btn-secondary">
 					<?php esc_html_e( 'Test API Connection', 'zw-knabbel-wp' ); ?>
 				</button>
-				<span id="api-test-result" class="knabbel-test-result"></span>
+				<span id="api-test-result" class="knabbel-test-result" role="status"></span>
 			</div>
 		</div>
 	</div>

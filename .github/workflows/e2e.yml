@@ -47,7 +47,7 @@ jobs:
           repository: oszuidwest/zwfm-babbel
           # Pull requests use a known-compatible contract. The weekly run follows
           # main so upstream compatibility regressions remain visible.
-          ref: ${{ github.event_name == 'schedule' && 'main' || '326b0ba59cfbea10e9a9eeb91d13d58db8c7fdc3' }}
+          ref: ${{ github.event_name == 'schedule' && 'main' || '0b7393b2bda9b3779f7b3747e077718ab0649435' }}
           path: zwfm-babbel
           persist-credentials: false
 

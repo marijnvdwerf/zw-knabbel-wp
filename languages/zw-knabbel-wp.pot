@@ -9,7 +9,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"POT-Creation-Date: 2026-08-13T23:57:24+00:00\n"
+"POT-Creation-Date: 2026-10-11T22:16:07+00:00\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "X-Generator: WP-CLI 2.12.0\n"
 "X-Domain: zw-knabbel-wp\n"
@@ -307,7 +307,7 @@ msgid "Babbel ID"
 msgstr ""
 
 #: includes/admin/settings.php:708
-#: zw-knabbel-wp.php:664
+#: zw-knabbel-wp.php:669
 msgid "Story is being processed..."
 msgstr ""
 
@@ -320,12 +320,11 @@ msgid "Refresh"
 msgstr ""
 
 #: includes/babbel-api.php:60
-#: includes/babbel-api.php:343
+#: includes/babbel-api.php:355
 msgid "Username and password are required"
 msgstr ""
 
 #: includes/babbel-api.php:94
-#: includes/babbel-api.php:352
 msgid "Login failed: "
 msgstr ""
 
@@ -333,100 +332,78 @@ msgstr ""
 msgid "No session cookies received"
 msgstr ""
 
-#: includes/babbel-api.php:200
-#: includes/babbel-api.php:206
-msgid "Could not encode story data"
-msgstr ""
-
-#: includes/babbel-api.php:231
-#: includes/babbel-api.php:452
-#: includes/babbel-api.php:527
-#: includes/babbel-api.php:626
-msgid "API connection failed: "
-msgstr ""
-
-#. translators: %1$d is the HTTP status code, %2$s is the response body.
-#: includes/babbel-api.php:253
-#: includes/babbel-api.php:474
-#: includes/babbel-api.php:550
-#: includes/babbel-api.php:648
+#. translators: %1$d is the HTTP status code, %2$s is the error message.
+#: includes/babbel-api.php:149
 #, php-format
 msgid "API error: HTTP %1$d - %2$s"
 msgstr ""
 
-#: includes/babbel-api.php:272
-#: includes/babbel-api.php:743
-#: includes/babbel-api.php:748
+#: includes/babbel-api.php:233
+#: includes/babbel-api.php:239
+msgid "Could not encode story data"
+msgstr ""
+
+#: includes/babbel-api.php:264
+#: includes/babbel-api.php:462
+#: includes/babbel-api.php:536
+#: includes/babbel-api.php:633
+msgid "API connection failed: "
+msgstr ""
+
+#: includes/babbel-api.php:303
+#: includes/babbel-api.php:392
+#: includes/babbel-api.php:751
+#: includes/babbel-api.php:756
 msgid "Invalid API response"
 msgstr ""
 
-#: includes/babbel-api.php:290
-msgid "API error"
-msgstr ""
-
-#: includes/babbel-api.php:307
+#: includes/babbel-api.php:319
 msgid "No story ID received from API"
 msgstr ""
 
-#: includes/babbel-api.php:325
-#: zw-knabbel-wp.php:719
+#: includes/babbel-api.php:337
+#: zw-knabbel-wp.php:724
 msgid "Story created successfully"
 msgstr ""
 
-#: includes/babbel-api.php:363
+#: includes/babbel-api.php:375
 msgid "Session verification failed: "
 msgstr ""
 
 #. translators: %s is the username.
-#: includes/babbel-api.php:376
+#: includes/babbel-api.php:399
 #, php-format
 msgid "Connected as: %s"
 msgstr ""
 
-#: includes/babbel-api.php:381
-msgid "Connection successful"
-msgstr ""
-
-#. translators: %d is the HTTP status code.
-#: includes/babbel-api.php:389
-#, php-format
-msgid "Unexpected response: HTTP %d"
-msgstr ""
-
-#: includes/babbel-api.php:411
+#: includes/babbel-api.php:421
 msgid "No data to update"
 msgstr ""
 
-#: includes/babbel-api.php:420
-#: includes/babbel-api.php:426
+#: includes/babbel-api.php:430
+#: includes/babbel-api.php:436
 msgid "Could not encode update data"
 msgstr ""
 
-#: includes/babbel-api.php:490
+#: includes/babbel-api.php:499
 msgid "Story updated successfully"
 msgstr ""
 
-#: includes/babbel-api.php:566
+#: includes/babbel-api.php:573
 msgid "Story deleted successfully"
 msgstr ""
 
-#: includes/babbel-api.php:594
-#: includes/babbel-api.php:600
+#: includes/babbel-api.php:601
+#: includes/babbel-api.php:607
 msgid "Could not encode restore data"
 msgstr ""
 
-#: includes/babbel-api.php:664
+#: includes/babbel-api.php:670
 msgid "Story restored successfully"
 msgstr ""
 
-#: includes/babbel-api.php:683
+#: includes/babbel-api.php:689
 msgid "Babbel API base URL not configured"
-msgstr ""
-
-#. translators: %d is the HTTP status code.
-#: includes/babbel-api.php:730
-#, php-format
-msgid "API error: HTTP %d"
 msgstr ""
 
 #: includes/post-hooks.php:110
@@ -486,18 +463,18 @@ msgstr ""
 msgid "Deleted"
 msgstr ""
 
-#: zw-knabbel-wp.php:600
+#: zw-knabbel-wp.php:605
 msgid "Insufficient permissions"
 msgstr ""
 
-#: zw-knabbel-wp.php:640
+#: zw-knabbel-wp.php:645
 msgid "Post not found"
 msgstr ""
 
-#: zw-knabbel-wp.php:653
+#: zw-knabbel-wp.php:658
 msgid "Send to Babbel is disabled for this post"
 msgstr ""
 
-#: zw-knabbel-wp.php:680
+#: zw-knabbel-wp.php:685
 msgid "Could not generate speech text"
 msgstr ""
