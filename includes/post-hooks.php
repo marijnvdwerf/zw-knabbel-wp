@@ -123,10 +123,17 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 		return false;
 	}
 
+	$state    = get_story_state( $post_id );
+	$story_id = (string) ( $state['story_id'] ?? '' );
+	if ( '' !== $story_id && ! empty( $state['remote_unverified'] ) ) {
+		if ( ! verify_remote_story( $post_id, $story_id ) ) {
+			return true;
+		}
+		$state = get_story_state( $post_id );
+	}
+
 	$send_to_babbel = (bool) get_post_meta( $post_id, '_zw_knabbel_send_to_babbel', true );
-	$state          = get_story_state( $post_id );
 	$status         = $state['status'] ?? '';
-	$story_id       = (string) ( $state['story_id'] ?? '' );
 	$active_status  = in_array( $post->post_status, array( 'publish', 'future' ), true );
 	$is_rescheduled = null !== $post_before && 'publish' === $post_before->post_status && 'future' === $post->post_status;
 	// Only a published or scheduled post with Radio News enabled has a story; a draft,
@@ -287,11 +294,10 @@ function story_fields_from_babbel( mixed $story ): ?array {
 /**
  * Sends what differs between the post and what Babbel last confirmed.
  *
- * A story synced before this snapshot existed, or whose last write may or may
- * not have reached Babbel, is read from Babbel first. For a published story
- * synced before, the fetched start date fixes the live moment, so upgrading
- * keeps the start date; the end date follows the current settings, like every
- * other window.
+ * A story synced before this snapshot existed is read from Babbel first. For
+ * a published story, the live moment is inferred from the fetched start date
+ * and the current start offset, so upgrading keeps the window as long as the
+ * offsets did not change since the story was created.
  *
  * @since 0.9.0
  *
@@ -324,7 +330,8 @@ function push_story_changes( int $post_id, string $story_id, \WP_Post $post, str
 		}
 
 		$migrated = array( 'synced' => $synced );
-		// The fetched start date fixes the live moment; the end date follows the current settings.
+		// The live moment is inferred as the fetched start date minus the current start offset; if the
+		// offsets changed since the story was created, the window follows the current settings.
 		if ( 'publish' === $post->post_status && ! is_string( $state['window_base'] ?? null ) ) {
 			$start_offset            = (int) get_plugin_settings()['start_days_offset'];
 			$base                    = ( new \DateTimeImmutable( $synced['start_date'], wp_timezone() ) )->modify( "-{$start_offset} day" );
@@ -580,6 +587,78 @@ function has_pending_story_action( string $hook, int $post_id ): bool {
 }
 
 /**
+ * Reports whether a failed write may still have reached Babbel.
+ *
+ * Only an HTTP 4xx answer proves Babbel rejected the write. A connection
+ * error, a timeout or a 5xx may hide a write Babbel did apply.
+ *
+ * @since 0.9.0
+ *
+ * @param array<string, mixed> $result Result of a failed Babbel call.
+ * @return bool True when Babbel's state is unknown.
+ *
+ * @phpstan-param BabbelApiResponse $result
+ */
+function babbel_write_uncertain( array $result ): bool {
+	$status_code = $result['status_code'] ?? 0;
+	return $status_code < 400 || $status_code >= 500;
+}
+
+/**
+ * Brings the local state in line with Babbel after an unanswered write.
+ *
+ * The story is read once: a live story counts as sent, with its fields as
+ * the confirmed snapshot; a story Babbel does not show counts as deleted.
+ * Reconciliation then decides from facts instead of from a guess.
+ *
+ * @since 0.9.0
+ *
+ * @param int    $post_id  Post ID.
+ * @param string $story_id Babbel story ID.
+ * @return bool True when the state is verified, false when Babbel could not be read.
+ */
+function verify_remote_story( int $post_id, string $story_id ): bool {
+	$fetched = babbel_get_story( $story_id );
+	$fields  = $fetched['success'] ? story_fields_from_babbel( $fetched['story'] ?? null ) : null;
+	if ( null !== $fields ) {
+		update_story_state(
+			$post_id,
+			array(
+				'status'            => StoryStatus::Sent->value,
+				'synced'            => $fields,
+				'remote_unverified' => null,
+			)
+		);
+		return true;
+	}
+
+	if ( 404 === ( $fetched['status_code'] ?? 0 ) ) {
+		update_story_state(
+			$post_id,
+			array(
+				'status'            => StoryStatus::Deleted->value,
+				'remote_unverified' => null,
+			)
+		);
+		return true;
+	}
+
+	log(
+		'error',
+		'PostHooks',
+		'Could not read the story from Babbel',
+		array(
+			'post_id'  => $post_id,
+			'story_id' => $story_id,
+			'error'    => $fetched['message'],
+		)
+	);
+	update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $fetched['message'], 'update' ) ) );
+	schedule_story_sync_retry( $post_id );
+	return false;
+}
+
+/**
  * Clears sync failure bookkeeping after Babbel matches the post.
  *
  * @since 0.9.0
@@ -598,6 +677,7 @@ function mark_story_synced( int $post_id, array $updates = array() ): void {
 			array(
 				'last_sync_error'     => null,
 				'sync_retry_attempts' => null,
+				'remote_unverified'   => null,
 			)
 		)
 	);
@@ -623,7 +703,9 @@ function restore_and_sync_story( int $post_id, string $story_id, \WP_Post $post 
 		update_story_state(
 			$post_id,
 			array(
-				'last_sync_error' => build_story_sync_error( $result['message'], 'restore' ),
+				'last_sync_error'   => build_story_sync_error( $result['message'], 'restore' ),
+				// The restore may still have reached Babbel; read it before deciding again.
+				'remote_unverified' => babbel_write_uncertain( $result ) ? true : null,
 			)
 		);
 		schedule_story_sync_retry( $post_id );
@@ -679,10 +761,9 @@ function push_story_update( int $post_id, string $story_id, array $update_data, 
 		return;
 	}
 
-	// Without an HTTP 4xx answer the write may still have reached Babbel; read it before the next comparison.
-	$status_code = $result['status_code'] ?? 0;
-	if ( $status_code < 400 || $status_code >= 500 ) {
-		$bookkeeping['synced'] = null;
+	// The write may still have reached Babbel; read it before the next comparison.
+	if ( babbel_write_uncertain( $result ) ) {
+		$bookkeeping['remote_unverified'] = true;
 	}
 
 	log(
@@ -747,7 +828,9 @@ function push_story_delete( int $post_id, string $story_id, string $success_mess
 	update_story_state(
 		$post_id,
 		array(
-			'last_sync_error' => build_story_sync_error( $result['message'], 'delete' ),
+			'last_sync_error'   => build_story_sync_error( $result['message'], 'delete' ),
+			// The delete may still have reached Babbel; read it before deciding again.
+			'remote_unverified' => babbel_write_uncertain( $result ) ? true : null,
 		)
 	);
 	schedule_story_sync_retry( $post_id );

@@ -60,6 +60,13 @@ final class Knabbel_E2E_Suite {
 	private array $failing_babbel_methods = array();
 
 	/**
+	 * HTTP methods whose Babbel story answers are currently lost.
+	 *
+	 * @var array<int, string>
+	 */
+	private array $lost_babbel_methods = array();
+
+	/**
 	 * WordPress ID of the shared published fixture.
 	 *
 	 * @var int
@@ -965,7 +972,7 @@ final class Knabbel_E2E_Suite {
 		$this->set_babbel_writes_failing( false );
 		$state = KnabbelWP\get_story_state( $post_id );
 		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'update' );
-		$this->assert_same( false, isset( $state['synced'] ), 'A write that may have reached Babbel must drop the snapshot.' );
+		$this->assert_same( true, $state['remote_unverified'] ?? null, 'A write that may have reached Babbel must be marked unverified.' );
 		$this->assert_same( 1, $this->sync_retry_count( $post_id ), 'A failed update must schedule exactly one retry.' );
 		$this->assert_same( 1, $state['sync_retry_attempts'] ?? null, 'The first retry must be counted.' );
 		$next_retry = as_next_scheduled_action( self::SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), self::ACTION_GROUP );
@@ -1161,6 +1168,42 @@ final class Knabbel_E2E_Suite {
 		$this->update_post( $post_id, array() );
 		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
 
+		// An update Babbel applied without answering is checked before the next comparison.
+		$current_title = (string) get_post_field( 'post_title', $post_id );
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		$this->update_post( $post_id, array( 'post_title' => $title . ' onbeantwoord' ) );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_same( true, KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'An unanswered update must be marked unverified.' );
+		$this->update_post( $post_id, array( 'post_title' => $current_title ) );
+		$this->assert_same( $current_title, $this->get_babbel_story( $story_id )['title'] ?? null, 'Reverting must reach Babbel after an unanswered update.' );
+		$this->assert_synced( $post_id, 'A verified story in line with the post must clear the failure.' );
+
+		// A delete Babbel applied without answering does not keep a re-enabled story deleted.
+		$this->set_lost_babbel_responses( array( 'DELETE' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Re-enabling after an unanswered delete must restore the story.' );
+		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $story_id );
+		$this->assert_synced( $post_id, 'A verified restore must clear the failure.' );
+
+		// A restore Babbel applied without answering does not keep a disabled story live.
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Precondition: disabling must delete the story.' );
+		$this->set_lost_babbel_responses( array( 'PATCH' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $story_id );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Disabling after an unanswered restore must delete the story.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: re-enabling must restore the story.' );
+		KnabbelWP\update_story_state( $post_id, array( 'window_base' => $this->past_post_date( 30 ) ) );
+		$this->update_post( $post_id, array() );
+		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
+
 		// Retries stop after the configured number of attempts.
 		$this->set_babbel_writes_failing( true );
 		$this->set_post_date( $post_id, $this->past_post_date( 6 ) );
@@ -1243,20 +1286,57 @@ final class Knabbel_E2E_Suite {
 		KnabbelWP\retry_story_sync( $post_id );
 		$this->assert_story_window( $story_id, $post_date, 'Migrating must send a date change that never reached Babbel.' );
 
+		// With changed offsets, the window follows the current settings: here the end date moves.
+		$created = KnabbelWP\calculate_story_dates( $this->past_post_date( 2 ) );
+		$this->babbel_request(
+			'PUT',
+			'/stories/' . $story_id,
+			array(
+				'start_date' => $created['start_date'],
+				'end_date'   => $created['end_date'],
+			)
+		);
+		$legacy_state = KnabbelWP\get_story_state( $post_id );
+		unset( $legacy_state['synced'], $legacy_state['window_base'] );
+		update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy_state );
+		$settings                    = get_option( 'knabbel_settings', array() );
+		$settings['end_days_offset'] = 5;
+		update_option( 'knabbel_settings', $settings );
+		try {
+			KnabbelWP\retry_story_sync( $post_id );
+			$live     = ( new DateTimeImmutable( $created['start_date'], wp_timezone() ) )->modify( '-1 day' )->format( 'Y-m-d H:i:s' );
+			$expected = KnabbelWP\calculate_story_dates( max( $post_date, $live ) );
+		} finally {
+			$this->configure_plugin();
+		}
+		$story = $this->get_babbel_story( $story_id );
+		$this->assert_same(
+			array( $expected['start_date'], $expected['end_date'] ),
+			array( $this->date_only( $story['start_date'] ?? '' ), $this->date_only( $story['end_date'] ?? '' ) ),
+			'With changed offsets, a migrated window must follow the documented rule.'
+		);
+
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' gemigreerd' ), 'Retries must never create another story.' );
 		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Retries must never queue story generation.' );
 		$this->assert_same( $ai_calls, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Retries must never generate speech text.' );
 
-		// A late scheduled publication gets a now window, also when it had to wait for the lock.
-		foreach ( array( false, true ) as $busy ) {
+		// A late scheduled publication gets a now window, also when it had to wait for the lock or the
+		// last update of the scheduled story went unanswered.
+		foreach ( array( 'direct', 'busy', 'unanswered' ) as $variant ) {
+			$busy    = 'busy' === $variant;
 			$late_id = $this->create_enabled_draft(
-				'E2E late publicatie ' . ( $busy ? 'uitgesteld' : 'direct' ),
+				'E2E late publicatie ' . $variant,
 				'Een geplande publicatie die te laat door cron wordt uitgevoerd krijgt een venster vanaf de publicatie.'
 			);
 			$this->schedule_post( $late_id, $this->future_post_date( 2 ) );
 			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $late_id ) );
 			$late_story_id = (string) ( KnabbelWP\get_story_state( $late_id )['story_id'] ?? '' );
-			$overdue       = $this->past_post_date( 1 );
+			if ( 'unanswered' === $variant ) {
+				$this->set_lost_babbel_responses( array( 'PUT' ) );
+				$this->update_post( $late_id, array( 'post_title' => 'E2E late publicatie onbeantwoord bewerkt' ) );
+				$this->set_lost_babbel_responses( array() );
+			}
+			$overdue = $this->past_post_date( 1 );
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Makes the scheduled date overdue, as a late cron run finds it.
 			$wpdb->update(
 				$wpdb->posts,
@@ -1288,7 +1368,7 @@ final class Knabbel_E2E_Suite {
 				$this->get_babbel_story( $late_story_id ),
 				$dates_before,
 				$dates_after,
-				'A late publication must get a now window' . ( $busy ? ' after waiting.' : '.' )
+				'A late publication must get a now window (' . $variant . ').'
 			);
 		}
 	}
@@ -1399,6 +1479,36 @@ final class Knabbel_E2E_Suite {
 	private function assert_recent_error_logged( string $error_message, string $message ): void {
 		$messages = array_column( (array) get_option( 'knabbel_recent_errors', array() ), 'message' );
 		$this->assert_same( true, in_array( $error_message, $messages, true ), $message );
+	}
+
+	/**
+	 * Lets story requests with the given methods reach Babbel but loses their answer.
+	 *
+	 * @param array<int, string> $methods HTTP methods whose answer is lost; empty to stop.
+	 */
+	private function set_lost_babbel_responses( array $methods ): void {
+		$this->lost_babbel_methods = $methods;
+		remove_filter( 'http_response', array( $this, 'lose_babbel_response' ), 1 );
+		if ( array() !== $methods ) {
+			add_filter( 'http_response', array( $this, 'lose_babbel_response' ), 1, 3 );
+		}
+	}
+
+	/**
+	 * Replaces an answer from Babbel with a timeout; see set_lost_babbel_responses().
+	 *
+	 * @param array<string, mixed>|WP_Error $response Response.
+	 * @param array<string, mixed>          $args     Request arguments.
+	 * @param string                        $url      Request URL.
+	 * @return array<string, mixed>|WP_Error Response.
+	 */
+	public function lose_babbel_response( array|WP_Error $response, array $args, string $url ): array|WP_Error {
+		$method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
+		if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories' ) && in_array( $method, $this->lost_babbel_methods, true ) ) {
+			return new WP_Error( 'http_request_failed', 'E2E: the answer from Babbel was lost' );
+		}
+
+		return $response;
 	}
 
 	/**

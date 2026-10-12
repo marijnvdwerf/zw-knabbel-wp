@@ -203,6 +203,13 @@ test.describe
                 page.locator('.knabbel-status-badge.deleted'),
             ).toBeVisible();
             expect(await babbelStoryStatus(storyID)).toBe(404);
+
+            // Leave Radio News enabled, so the next test disables it itself.
+            await setBabbelEnabled(page, true);
+            await savePost(page);
+            await expect(
+                page.locator('.knabbel-status-badge.sent'),
+            ).toBeVisible();
         });
 
         test('redacteur schakelt Babbel uit en herstelt daarna hetzelfde verhaal', async ({
