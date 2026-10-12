@@ -1024,9 +1024,9 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( 0, $requests, 'A sync must not talk to Babbel without the lock.' );
 		$this->assert_same( true, $this->sync_lock_exists( $post_id ), 'A live lock must not be taken over.' );
 		$this->assert_same(
-			array( array( 'title' => $title . ' uitgesteld' ) ),
+			array( array( 'window' => false ) ),
 			get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ),
-			'The deferred change must be stored.'
+			'The deferred change must be stored without values.'
 		);
 		$this->assert_same(
 			1,
@@ -1041,6 +1041,56 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( $title . ' uitgesteld', $this->get_babbel_story( $story_id )['title'] ?? null, 'The deferred change must reach Babbel.' );
 		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'A synced deferred change must be removed.' );
 		$this->assert_synced( $post_id, 'A deferred sync must leave nothing pending.' );
+
+		// A deferred change from an older save sends the post as it is now, not its own older values.
+		$newer_date = $this->past_post_date( 2 );
+		add_post_meta( $post_id, '_zw_knabbel_deferred_update', array( 'window' => true ) );
+		$this->set_post_date( $post_id, $newer_date );
+		$this->assert_story_window( $story_id, $newer_date, 'Absorbing an older deferred change must keep the newest date.' );
+		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'Absorbed rows must be removed.' );
+
+		// A deferred sync that finds the lock busy again queues its successor.
+		$this->insert_sync_lock( $post_id, time() + 60 );
+		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+		try {
+			$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
+			$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'A status change alone stores no row.' );
+			$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+			$this->delete_sync_lock( $post_id );
+		}
+		$this->assert_same(
+			1,
+			$this->action_count( self::DEFERRED_SYNC_HOOK, ActionScheduler_Store::STATUS_PENDING, array( 'post_id' => $post_id ) ),
+			'A deferred sync that defers again must queue its successor.'
+		);
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Nothing may happen while the lock is busy.' );
+
+		// The deferred sync then removes the story of the unpublished post, as the save would have.
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'A deferred unpublish must delete the story.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: publishing again must restore the story.' );
+
+		// A deferred sync that cannot be queued is logged.
+		$this->insert_sync_lock( $post_id, time() + 60 );
+		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+		add_filter( 'pre_as_enqueue_async_action', '__return_zero' );
+		try {
+			$this->update_post( $post_id, array( 'post_title' => $title . ' niet ingepland' ) );
+		} finally {
+			remove_filter( 'pre_as_enqueue_async_action', '__return_zero' );
+			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+			$this->delete_sync_lock( $post_id );
+		}
+		$this->assert_recent_error_logged(
+			'Could not queue a deferred Babbel sync; the next save of this post syncs it',
+			'A failed deferral must be logged.'
+		);
+		$this->update_post( $post_id, array() );
+		$this->assert_same( $title . ' niet ingepland', $this->get_babbel_story( $story_id )['title'] ?? null, 'The next save must sync the change.' );
 
 		// Releasing never removes a lock that another request took over.
 		$token = KnabbelWP\acquire_story_sync_lock( $post_id );

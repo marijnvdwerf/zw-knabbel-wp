@@ -40,7 +40,7 @@ function register_post_hooks(): void {
 	add_action( 'deleted_post_meta', __NAMESPACE__ . '\\handle_checkbox_meta_changed', 10, 3 );
 
 	add_action( STORY_SYNC_RETRY_HOOK, __NAMESPACE__ . '\\retry_story_sync', 10, 1 );
-	add_action( STORY_SYNC_DEFERRED_HOOK, __NAMESPACE__ . '\\sync_story_state', 10, 1 );
+	add_action( STORY_SYNC_DEFERRED_HOOK, __NAMESPACE__ . '\\retry_story_sync', 10, 1 );
 }
 
 /**
@@ -103,16 +103,21 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
 /**
  * Reconciles story state while holding the post's sync lock.
  *
+ * Without the previous post, it works from the current post and story state
+ * alone. A retry also resends an update error that predates pending fields.
+ *
  * @since 0.9.0
  *
  * @param int           $post_id     Post ID.
  * @param \WP_Post|null $post_before Post state before a save, when available.
+ * @param bool          $retry       Whether this retries a failed sync.
+ * @return bool True when Babbel was written to.
  */
-function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
+function reconcile_story_state( int $post_id, ?\WP_Post $post_before, bool $retry = false ): bool {
 	$post = get_post( $post_id );
 	// Revisions and autosaves have post type 'revision', so this also excludes them.
 	if ( ! $post || 'post' !== $post->post_type ) {
-		return;
+		return false;
 	}
 
 	$send_to_babbel = (bool) get_post_meta( $post_id, '_zw_knabbel_send_to_babbel', true );
@@ -150,22 +155,23 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
 			}
 
 			push_story_delete( $post_id, $story_id, $message, $context );
+			return true;
 		} elseif ( in_array( $status, array( StoryStatus::Scheduled->value, StoryStatus::Processing->value ), true ) ) {
 			// Only these states can have a pending processing action.
 			\as_unschedule_all_actions( 'knabbel_process_story', array( 'post_id' => $post_id ), 'zw-knabbel-wp' );
 			delete_post_meta( $post_id, '_zw_knabbel_story_state' );
 		}
-		return;
+		return false;
 	}
 
 	$should_restore = $is_untrash || $is_activated || ( null === $post_before && $active_status );
 	if ( $story_id && StoryStatus::Deleted->value === $status && $should_restore ) {
 		restore_and_sync_story( $post_id, $story_id, $post->post_title );
-		return;
+		return true;
 	}
 
 	if ( ! $active_status ) {
-		return;
+		return false;
 	}
 
 	$stable_statuses = array(
@@ -176,24 +182,32 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
 	);
 	if ( ! in_array( $status, $stable_statuses, true ) ) {
 		schedule_story_processing( $post_id );
-		return;
+		return false;
 	}
 
 	if ( ! $story_id || StoryStatus::Sent->value !== $status ) {
-		return;
+		return false;
 	}
 
 	$change      = null === $post_before ? null : story_update_for_transition( $post, $post_before );
 	$update_data = with_pending_story_update( $state, $post->post_title, $change['data'] ?? null );
-	if ( null !== $update_data ) {
-		push_story_update(
-			$post_id,
-			$story_id,
-			$update_data,
-			$change['message'] ?? __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
-			$change['context'] ?? 'pending_update'
-		);
+	$error       = get_story_sync_error( $state );
+	if ( null === $update_data && $retry && in_array( $error['operation'] ?? '', array( 'update', 'restore' ), true ) ) {
+		// An error recorded before pending fields existed lists none: send the full payload.
+		$update_data = build_full_story_update( $post->post_title, $post->post_date );
 	}
+	if ( null === $update_data ) {
+		return false;
+	}
+
+	push_story_update(
+		$post_id,
+		$story_id,
+		$update_data,
+		$change['message'] ?? __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
+		$change['context'] ?? ( $retry ? 'sync_retry' : 'pending_update' )
+	);
+	return true;
 }
 
 /**
@@ -203,15 +217,17 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
  *
  * @param \WP_Post $post        Current post.
  * @param \WP_Post $post_before Post before the save.
- * @return array{data: array<string, mixed>, message: string, context: string}|null The update, or null when the save changes nothing in Babbel.
+ * @return array{data: array<string, mixed>, window: string, message: string, context: string}|null The update and the base of
+ *         its window ('post_date', 'now', or '' for a title-only update), or null when the save changes nothing in Babbel.
  *
- * @phpstan-return array{data: StoryUpdateData, message: string, context: string}|null
+ * @phpstan-return array{data: StoryUpdateData, window: string, message: string, context: string}|null
  */
 function story_update_for_transition( \WP_Post $post, \WP_Post $post_before ): ?array {
 	if ( 'future' === $post->post_status && 'publish' === $post_before->post_status ) {
 		// An embargo set after publication moves the window to the new publication date.
 		return array(
 			'data'    => build_full_story_update( $post->post_title, $post->post_date ),
+			'window'  => 'post_date',
 			'message' => __( 'Story updated (post rescheduled)', 'zw-knabbel-wp' ),
 			'context' => 'publish_to_future',
 		);
@@ -220,6 +236,7 @@ function story_update_for_transition( \WP_Post $post, \WP_Post $post_before ): ?
 	if ( 'publish' === $post->post_status && 'future' === $post_before->post_status ) {
 		return array(
 			'data'    => build_full_story_update( $post->post_title, 'now' ),
+			'window'  => 'now',
 			'message' => __( 'Story updated (post published)', 'zw-knabbel-wp' ),
 			'context' => 'future_to_publish',
 		);
@@ -232,6 +249,7 @@ function story_update_for_transition( \WP_Post $post, \WP_Post $post_before ): ?
 
 	return array(
 		'data'    => $update_data,
+		'window'  => isset( $update_data['start_date'] ) ? 'post_date' : '',
 		'message' => __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
 		'context' => 'publish' === $post->post_status ? 'published_post_edit' : 'scheduled_post_edit',
 	);
@@ -296,11 +314,12 @@ function with_pending_story_update( array $state, string $title, ?array $update_
 /**
  * Retries a failed synchronization from the current post and story state.
  *
- * Runs from Action Scheduler and from the editor's "Sync again" action. It
- * works from state rather than from the failed operation, so it never sends
- * what the post no longer wants. It never creates a story or generates text.
- * An update error without pending fields, recorded before they existed, gets
- * the full payload based on the post date.
+ * Runs from Action Scheduler, for a deferred sync and for "Save and sync
+ * again". It works from state rather than from the failed operation, so it
+ * never sends what the post no longer wants: it deletes, restores or sends
+ * pending fields as a save would. An update error without pending fields,
+ * recorded before they existed, gets the full payload based on the post date.
+ * An error whose operation is no longer wanted is cleared.
  *
  * @since 0.9.0
  *
@@ -320,40 +339,15 @@ function retry_story_sync( int $post_id ): void {
  * @param int $post_id Post ID.
  */
 function run_story_sync_retry( int $post_id ): void {
-	$post     = get_post( $post_id );
-	$state    = get_story_state( $post_id );
-	$story_id = (string) ( $state['story_id'] ?? '' );
-	$error    = get_story_sync_error( $state );
-	if ( ! $post || 'post' !== $post->post_type || '' === $story_id || null === $error ) {
+	if ( reconcile_story_state( $post_id, null, true ) ) {
 		return;
 	}
 
-	$status = $state['status'] ?? '';
-	$wanted = (bool) get_post_meta( $post_id, '_zw_knabbel_send_to_babbel', true )
-		&& in_array( $post->post_status, array( 'publish', 'future' ), true );
-
-	if ( StoryStatus::Sent->value === $status && ! $wanted ) {
-		push_story_delete( $post_id, $story_id, __( 'Story deleted from Babbel', 'zw-knabbel-wp' ), 'sync_retry' );
-		return;
+	$error = get_story_sync_error( get_story_state( $post_id ) );
+	if ( null !== $error && 'create' !== $error['operation'] ) {
+		// Nothing was left to write, so the failed operation is no longer wanted.
+		mark_story_synced( $post_id );
 	}
-
-	if ( StoryStatus::Deleted->value === $status && $wanted ) {
-		restore_and_sync_story( $post_id, $story_id, $post->post_title );
-		return;
-	}
-
-	$update_data = with_pending_story_update( $state, $post->post_title, null );
-	if ( null === $update_data && in_array( $error['operation'], array( 'update', 'restore' ), true ) ) {
-		// An error recorded before pending updates existed lists no fields: send the full payload.
-		$update_data = build_full_story_update( $post->post_title, $post->post_date );
-	}
-	if ( StoryStatus::Sent->value === $status && null !== $update_data ) {
-		push_story_update( $post_id, $story_id, $update_data, __( 'Story updated in Babbel', 'zw-knabbel-wp' ), 'sync_retry' );
-		return;
-	}
-
-	// The failed operation is no longer wanted, so there is nothing left to sync.
-	mark_story_synced( $post_id );
 }
 
 /**
@@ -472,9 +466,11 @@ function release_story_sync_lock( int $post_id, string $token ): void {
 /**
  * Sets a sync aside for later because another sync of the post is running.
  *
- * A save's own change is only known now, from the previous post, so it is
- * stored as its own meta row: adding a row never overwrites another
- * request's. A queued sync then takes it in under the lock.
+ * A save's own change is only known now, from the previous post, so what
+ * changed is stored as its own meta row: adding a row never overwrites
+ * another request's. The row holds no values, only whether the window moved;
+ * the queued sync computes the values from the post as it is then, so the
+ * order in which rows arrive cannot matter.
  *
  * @since 0.9.0
  *
@@ -485,14 +481,17 @@ function defer_story_sync( int $post_id, ?\WP_Post $post_before ): void {
 	$post   = get_post( $post_id );
 	$change = $post && null !== $post_before ? story_update_for_transition( $post, $post_before ) : null;
 	if ( null !== $change ) {
-		add_post_meta( $post_id, STORY_SYNC_DEFERRED_META, $change['data'] );
+		add_post_meta( $post_id, STORY_SYNC_DEFERRED_META, array( 'window' => '' !== $change['window'] ) );
 	}
 
-	// A deferred sync that is running and defers again must queue its successor.
-	if ( ! has_pending_story_action( STORY_SYNC_DEFERRED_HOOK, $post_id ) ) {
-		\as_enqueue_async_action( STORY_SYNC_DEFERRED_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' );
-	}
 	log( 'error', 'PostHooks', 'Another Babbel sync of this post is running; deferred this one', array( 'post_id' => $post_id ) );
+	// A deferred sync that is running and defers again must queue its successor.
+	if (
+		! has_pending_story_action( STORY_SYNC_DEFERRED_HOOK, $post_id )
+		&& ! \as_enqueue_async_action( STORY_SYNC_DEFERRED_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' )
+	) {
+		log( 'error', 'PostHooks', 'Could not queue a deferred Babbel sync; the next save of this post syncs it', array( 'post_id' => $post_id ) );
+	}
 }
 
 /**
@@ -516,21 +515,32 @@ function absorb_deferred_story_updates( int $post_id ): void {
 			STORY_SYNC_DEFERRED_META
 		)
 	);
-	if ( array() === $rows ) {
+	$post = get_post( $post_id );
+	if ( array() === $rows || ! $post ) {
 		return;
 	}
 
-	$state   = get_story_state( $post_id );
-	$pending = array();
+	// Values come from the post as it is now; a row only says whether the window moved. The
+	// window then follows the post date, which for a publication equals its publication time.
+	$deferred = array( 'title' => $post->post_title );
 	foreach ( $rows as $row ) {
-		$fields  = get_pending_story_update( array( 'pending_update' => maybe_unserialize( $row->meta_value ) ) );
-		$pending = array_merge( $pending, $fields ?? array() );
-		delete_metadata_by_mid( 'post', (int) $row->meta_id );
+		if ( ! empty( maybe_unserialize( $row->meta_value )['window'] ) ) {
+			$deferred = build_full_story_update( $post->post_title, $post->post_date );
+		}
 	}
 
-	$merged = array_merge( get_pending_story_update( $state ) ?? array(), $pending );
-	if ( array() !== $merged ) {
-		update_story_state( $post_id, array( 'pending_update' => $merged ) );
+	$merged = array_merge( get_pending_story_update( get_story_state( $post_id ) ) ?? array(), $deferred );
+	update_story_state( $post_id, array( 'pending_update' => $merged ) );
+	// Delete the rows only once the pending update holds them.
+	$stored = get_pending_story_update( get_story_state( $post_id ) ) ?? array();
+	ksort( $stored );
+	ksort( $merged );
+	if ( $stored !== $merged ) {
+		log( 'error', 'PostHooks', 'Could not store deferred Babbel changes; keeping them for the next sync', array( 'post_id' => $post_id ) );
+		return;
+	}
+	foreach ( $rows as $row ) {
+		delete_metadata_by_mid( 'post', (int) $row->meta_id );
 	}
 }
 
@@ -644,8 +654,9 @@ function restore_and_sync_story( int $post_id, string $story_id, string $title )
 		return $result;
 	}
 
-	// Sync the current post title via PUT (PATCH only accepts status/deleted_at).
-	$title_result = babbel_update_story( $story_id, array( 'title' => $title ) );
+	// Sync the current title and any pending fields via PUT (PATCH only accepts status/deleted_at).
+	$update_data  = with_pending_story_update( get_story_state( $post_id ), $title, array( 'title' => $title ) ) ?? array( 'title' => $title );
+	$title_result = babbel_update_story( $story_id, $update_data );
 	if ( $title_result['success'] ) {
 		mark_story_synced(
 			$post_id,
@@ -672,7 +683,7 @@ function restore_and_sync_story( int $post_id, string $story_id, string $title )
 				'status'          => StoryStatus::Sent->value,
 				'message'         => __( 'Story restored in Babbel', 'zw-knabbel-wp' ),
 				'last_sync_error' => build_story_sync_error( $title_result['message'], 'restore' ),
-				'pending_update'  => array( 'title' => $title ),
+				'pending_update'  => $update_data,
 			)
 		);
 		schedule_story_sync_retry( $post_id );
