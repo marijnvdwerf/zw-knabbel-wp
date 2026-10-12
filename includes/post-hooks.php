@@ -157,6 +157,12 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 			return true;
 		}
 		$state = get_story_state( $post_id );
+		// Settling takes requests to Babbel; the post is read again, as a save may have changed it.
+		clean_post_cache( $post_id );
+		$post = get_post( $post_id );
+		if ( ! $post ) {
+			return true;
+		}
 	}
 	$story_id = (string) ( $state['story_id'] ?? '' );
 	if ( '' !== $story_id && ! empty( $state['remote_unverified'] ) ) {
@@ -1131,7 +1137,13 @@ function resolve_pending_create( int $post_id ): ?bool {
 	// Babbel answers a create repeated with the same idempotency key with the story the first one
 	// made, or makes it now: that settles the attempt without a lookup or a deadline.
 	if ( isset( $pending['request'] ) ) {
-		$replay = babbel_create_story( $pending['request'] );
+		// A save made while the repeat runs, from a hook for example, waits for its answer.
+		story_create_in_flight( $post_id, true );
+		try {
+			$replay = babbel_create_story( $pending['request'] );
+		} finally {
+			story_create_in_flight( $post_id, false );
+		}
 		if ( $replay['success'] ) {
 			// The repeat names the story; reading it tells whether it was deleted in Babbel since.
 			$found = babbel_find_story( (string) $replay['story_id'] );
@@ -1139,13 +1151,14 @@ function resolve_pending_create( int $post_id ): ?bool {
 				return adopt_created_story( $post_id, $pending, (string) $replay['story_id'], (array) ( $found['story'] ?? array() ) );
 			}
 			$replay = array_merge( $found, array( 'message' => $found['success'] ? __( 'Invalid API response', 'zw-knabbel-wp' ) : $found['message'] ) );
-		} elseif ( ! empty( $replay['unsupported'] ) || in_array( $replay['status_code'] ?? 0, array( 400, 422 ), true ) ) {
-			// Babbel validates the body before it reads the key, so a rejected repeat proves nothing
-			// about the first create: the attempt is looked up by its token instead.
+		} elseif ( ! empty( $replay['unsupported'] ) ) {
+			// Babbel no longer takes the key, so it never kept one: the attempt is looked up by its token.
 			unset( $pending['request'] );
 			update_story_state( $post_id, array( 'pending_create' => $pending ) );
 			return resolve_pending_create( $post_id );
 		}
+		// Any other failure, a rejected repeat included, proves nothing about the first create: Babbel
+		// validates the body before it reads the key. The attempt keeps its key and is tried again.
 		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $replay['message'], 'create' ) ) );
 		schedule_story_sync_retry( $post_id );
 		schedule_story_sync_at( $post_id, time() + HOUR_IN_SECONDS );

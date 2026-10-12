@@ -2567,7 +2567,8 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The repeat must make the story at once.' );
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'Exactly one story must exist.' );
 
-		// A rejected repeat proves nothing about the first create: the story is then found by its token.
+		// A rejected repeat proves nothing about the first create: the attempt keeps its key and the
+		// next repeat settles it.
 		$title     = 'E2E aanmaken met sleutel en geweigerde herhaling';
 		$post_id   = $this->create_enabled_draft( $title, 'De herhaling wordt geweigerd.' );
 		$posts     = 0;
@@ -2588,7 +2589,55 @@ final class Knabbel_E2E_Suite {
 		} finally {
 			remove_filter( 'http_response', $lose_then, 1 );
 		}
-		$this->assert_story_status( $post_id, StoryStatus::Sent, 'A rejected repeat must fall back to the token and adopt the story.' );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( StoryStatus::Error->value, true, 1 ),
+			array( $state['status'] ?? null, isset( $state['pending_create']['request'] ), $this->sync_retry_count( $post_id ) ),
+			'A rejected repeat must keep the attempt and its key, and retry.'
+		);
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The next repeat must adopt the story.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// A reschedule from a hook while the repeat runs waits for it, and reaches the adopted story.
+		$title      = 'E2E aanmaken met sleutel en verplaatst tijdens herhaling';
+		$post_id    = $this->create_enabled_draft( $title, 'Tijdens de herhaling krijgt het artikel een embargo.' );
+		$embargo    = $this->future_post_date( 10 );
+		$posts      = 0;
+		$reschedule = function ( $response, array $args, string $url ) use ( $post_id, $embargo, &$posts ) {
+			if ( 'POST' !== ( $args['method'] ?? '' ) || ! str_ends_with( $url, '/stories' ) ) {
+				return $response;
+			}
+			++$posts;
+			if ( 1 === $posts ) {
+				return new WP_Error( 'http_request_failed', 'E2E: the answer from Babbel was lost' );
+			}
+			if ( 2 === $posts ) {
+				$this->schedule_post( $post_id, $embargo );
+			}
+			return $response;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+		}
+		add_filter( 'http_response', $reschedule, 1, 3 );
+		$posts = 1;
+		try {
+			$this->run_pending_sync_retry( $post_id );
+		} finally {
+			remove_filter( 'http_response', $reschedule, 1 );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$story_id = (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' );
+		$this->assert_same(
+			KnabbelWP\calculate_story_dates( $embargo )['start_date'],
+			substr( (string) ( $this->get_babbel_story( $story_id )['start_date'] ?? '' ), 0, 10 ),
+			'A reschedule during the repeat must reach the adopted story.'
+		);
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
 
 		// The stored request keeps backslashes, so the repeat sends exactly the first request.
