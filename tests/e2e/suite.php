@@ -590,8 +590,29 @@ final class Knabbel_E2E_Suite {
 			)
 		);
 
-		as_enqueue_async_action( self::FEW_SHOT_HOOK, array(), self::ACTION_GROUP );
-		$this->run_action_scheduler( self::FEW_SHOT_HOOK );
+		// The created_at cutoff carries a "+00:00" offset; unencoded, Babbel would read the "+" as a space (#97).
+		$list_urls = array();
+		$capture   = static function ( $preempt, array $args, string $url ) use ( &$list_urls ) {
+			if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories?' ) ) {
+				$list_urls[] = $url;
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $capture, 1, 3 );
+		try {
+			as_enqueue_async_action( self::FEW_SHOT_HOOK, array(), self::ACTION_GROUP );
+			$this->run_action_scheduler( self::FEW_SHOT_HOOK );
+		} finally {
+			remove_filter( 'pre_http_request', $capture, 1 );
+		}
+		$this->assert_same( 1, count( $list_urls ), 'The few-shot sync must list stories once.' );
+		parse_str( (string) wp_parse_url( $list_urls[0], PHP_URL_QUERY ), $query );
+		$cutoff = $query['filter']['created_at']['gte'] ?? '';
+		$this->assert_same(
+			true,
+			str_ends_with( $cutoff, '+00:00' ) && false !== strtotime( $cutoff ),
+			'The created_at cutoff must reach Babbel with its UTC offset intact, got ' . $cutoff . '.'
+		);
 
 		$examples = get_option( 'knabbel_few_shot_examples', array() );
 		$this->assert_same( 1, count( $examples ), 'Few-shot sync must cache the available candidate.' );
