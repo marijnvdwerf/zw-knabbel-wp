@@ -673,7 +673,8 @@ function babbel_restore_story( string $story_id, array $fields = array() ): arra
 			)
 		);
 		$problem = json_decode( $body, true );
-		$codes   = array_column( array_filter( (array) ( is_array( $problem ) ? ( $problem['errors'] ?? array() ) : array() ), 'is_array' ), 'code' );
+		$errors  = is_array( $problem ) ? (array) ( $problem['errors'] ?? array() ) : array();
+		$codes   = array_column( array_filter( $errors, 'is_array' ), 'code' );
 		return array(
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),

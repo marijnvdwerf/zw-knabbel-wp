@@ -544,16 +544,7 @@ final class Knabbel_E2E_Suite {
 		wp_trash_post( $post_id );
 		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Trashing must mark the remote story deleted.' );
 		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
-		$trashed = $this->babbel_get_json(
-			'/stories?' . http_build_query(
-				array(
-					'trashed' => 'with',
-					'filter'  => array( 'id' => $story_id ),
-				)
-			),
-			'The deleted story must be listed with trashed stories.'
-		);
-		$this->assert_same( 0, $trashed['data'][0]['weekdays'] ?? null, 'A deleted story must be parked on no weekdays.' );
+		$this->assert_same( 0, $this->trashed_story( $story_id )['weekdays'] ?? null, 'A deleted story must be parked on no weekdays.' );
 
 		wp_untrash_post( $post_id );
 		$this->assert_same( 'draft', get_post_status( $post_id ), 'Precondition: WordPress untrashes a post as draft.' );
@@ -1622,20 +1613,14 @@ final class Knabbel_E2E_Suite {
 				++$bare;
 				return $preempt;
 			}
-			return array(
-				'headers'  => array( 'content-type' => 'application/problem+json' ),
-				'body'     => (string) wp_json_encode(
-					array(
-						'status' => 404,
-						'detail' => 'Story not found',
-						'code'   => 'story.not_found',
-					)
-				),
-				'response' => array(
-					'code'    => 404,
-					'message' => 'Not Found',
-				),
-				'cookies'  => array(),
+			return self::problem_response(
+				404,
+				'Not Found',
+				array(
+					'status' => 404,
+					'detail' => 'Story not found',
+					'code'   => 'story.not_found',
+				)
 			);
 		};
 		add_filter( 'pre_http_request', $not_here, 1, 3 );
@@ -1678,15 +1663,7 @@ final class Knabbel_E2E_Suite {
 			if ( 'DELETE' !== ( $args['method'] ?? '' ) ) {
 				return $preempt;
 			}
-			return array(
-				'headers'  => array( 'content-type' => 'application/problem+json' ),
-				'body'     => (string) wp_json_encode( array( 'detail' => 'E2E: delete rejected' ) ),
-				'response' => array(
-					'code'    => 403,
-					'message' => 'Forbidden',
-				),
-				'cookies'  => array(),
-			);
+			return self::problem_response( 403, 'Forbidden', array( 'detail' => 'E2E: delete rejected' ) );
 		};
 		add_filter( 'pre_http_request', $reject_delete, 1, 2 );
 		try {
@@ -1875,31 +1852,28 @@ final class Knabbel_E2E_Suite {
 				|| ! str_starts_with( $url, self::BABBEL_BASE_URL . '/stories/' )
 				|| ! is_array( $body )
 				|| ! array_key_exists( 'deleted_at', $body )
-				|| array() === array_diff_key( $body, array( 'deleted_at' => true ) )
 			) {
 				return $preempt;
 			}
-			return array(
-				'headers'  => array( 'content-type' => 'application/problem+json' ),
-				'body'     => (string) wp_json_encode(
-					array(
-						'title'  => 'Bad Request',
-						'status' => 400,
-						'detail' => 'Request body is not valid JSON for this endpoint',
-						'errors' => array(
-							array(
-								'field'   => (string) array_key_first( array_diff_key( $body, array( 'deleted_at' => true ) ) ),
-								'code'    => 'unknown_field',
-								'message' => 'unknown field',
-							),
+			$fields = array_diff_key( $body, array( 'deleted_at' => true ) );
+			if ( array() === $fields ) {
+				return $preempt;
+			}
+			return self::problem_response(
+				400,
+				'Bad Request',
+				array(
+					'title'  => 'Bad Request',
+					'status' => 400,
+					'detail' => 'Request body is not valid JSON for this endpoint',
+					'errors' => array(
+						array(
+							'field'   => (string) array_key_first( $fields ),
+							'code'    => 'unknown_field',
+							'message' => 'unknown field',
 						),
-					)
-				),
-				'response' => array(
-					'code'    => 400,
-					'message' => 'Bad Request',
-				),
-				'cookies'  => array(),
+					),
+				)
 			);
 		};
 		add_filter( 'pre_http_request', $reject, 1, 3 );
@@ -2009,19 +1983,13 @@ final class Knabbel_E2E_Suite {
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
 		$reject_put = static function ( $preempt, array $args ) {
 			if ( 'PUT' === ( $args['method'] ?? '' ) ) {
-				return array(
-					'headers'  => array( 'content-type' => 'application/problem+json' ),
-					'body'     => wp_json_encode(
-						array(
-							'detail' => 'E2E: updating is not allowed right now',
-							'code'   => 'auth.forbidden',
-						)
-					),
-					'response' => array(
-						'code'    => 403,
-						'message' => 'Forbidden',
-					),
-					'cookies'  => array(),
+				return self::problem_response(
+					403,
+					'Forbidden',
+					array(
+						'detail' => 'E2E: updating is not allowed right now',
+						'code'   => 'auth.forbidden',
+					)
 				);
 			}
 			return $preempt;
@@ -2147,19 +2115,13 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: re-enabling must restore the story.' );
 		$reject_delete = static function ( $preempt, array $args ) {
 			if ( 'DELETE' === ( $args['method'] ?? '' ) ) {
-				return array(
-					'headers'  => array( 'content-type' => 'application/problem+json' ),
-					'body'     => wp_json_encode(
-						array(
-							'detail' => 'E2E: deleting is not allowed right now',
-							'code'   => 'auth.forbidden',
-						)
-					),
-					'response' => array(
-						'code'    => 403,
-						'message' => 'Forbidden',
-					),
-					'cookies'  => array(),
+				return self::problem_response(
+					403,
+					'Forbidden',
+					array(
+						'detail' => 'E2E: deleting is not allowed right now',
+						'code'   => 'auth.forbidden',
+					)
 				);
 			}
 			return $preempt;
@@ -2227,33 +2189,14 @@ final class Knabbel_E2E_Suite {
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
 		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Precondition: disabling must delete the story.' );
 		$this->set_stale_story_window_while_deleted( $post_id, $story_id );
-		$reject_delete_only = static function ( $preempt, array $args ) {
-			if ( 'DELETE' === ( $args['method'] ?? '' ) ) {
-				return array(
-					'headers'  => array( 'content-type' => 'application/problem+json' ),
-					'body'     => wp_json_encode(
-						array(
-							'detail' => 'E2E: deleting is not allowed right now',
-							'code'   => 'auth.forbidden',
-						)
-					),
-					'response' => array(
-						'code'    => 403,
-						'message' => 'Forbidden',
-					),
-					'cookies'  => array(),
-				);
-			}
-			return $preempt;
-		};
 		add_filter( 'http_response', $empty_patch, 20, 2 );
-		add_filter( 'pre_http_request', $reject_delete_only, 1, 2 );
+		add_filter( 'pre_http_request', $reject_delete, 1, 2 );
 		add_filter( 'pre_http_request', $fail_read, 1, 3 );
 		try {
 			update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
 		} finally {
 			remove_filter( 'pre_http_request', $fail_read, 1 );
-			remove_filter( 'pre_http_request', $reject_delete_only, 1 );
+			remove_filter( 'pre_http_request', $reject_delete, 1 );
 			remove_filter( 'http_response', $empty_patch, 20 );
 		}
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: a rejected rollback must keep the story live.' );
@@ -2313,19 +2256,13 @@ final class Knabbel_E2E_Suite {
 		};
 		$reject_writes    = static function ( $preempt, array $args ) {
 			if ( in_array( $args['method'] ?? '', array( 'PUT', 'DELETE' ), true ) ) {
-				return array(
-					'headers'  => array( 'content-type' => 'application/problem+json' ),
-					'body'     => wp_json_encode(
-						array(
-							'detail' => 'E2E: not allowed right now',
-							'code'   => 'auth.forbidden',
-						)
-					),
-					'response' => array(
-						'code'    => 403,
-						'message' => 'Forbidden',
-					),
-					'cookies'  => array(),
+				return self::problem_response(
+					403,
+					'Forbidden',
+					array(
+						'detail' => 'E2E: not allowed right now',
+						'code'   => 'auth.forbidden',
+					)
 				);
 			}
 			return $preempt;
@@ -2450,6 +2387,26 @@ final class Knabbel_E2E_Suite {
 		$response = $this->babbel_request( 'PUT', '/stories/' . $story_id, array( 'status' => $status ) );
 		$this->assert_same( 200, wp_remote_retrieve_response_code( $response ), 'Precondition: the status update must succeed.' );
 		$this->assert_same( $status, $this->get_babbel_story( $story_id )['status'] ?? null, 'Precondition: the story must have status ' . $status . '.' );
+	}
+
+	/**
+	 * Builds a Babbel Problem Details answer for a pre_http_request filter.
+	 *
+	 * @param int                  $code    HTTP status code.
+	 * @param string               $reason  HTTP reason phrase.
+	 * @param array<string, mixed> $problem Problem Details body.
+	 * @return array<string, mixed> The response.
+	 */
+	private static function problem_response( int $code, string $reason, array $problem ): array {
+		return array(
+			'headers'  => array( 'content-type' => 'application/problem+json' ),
+			'body'     => (string) wp_json_encode( $problem ),
+			'response' => array(
+				'code'    => $code,
+				'message' => $reason,
+			),
+			'cookies'  => array(),
+		);
 	}
 
 	/**
