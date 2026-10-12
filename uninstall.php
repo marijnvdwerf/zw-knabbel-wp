@@ -26,8 +26,9 @@ delete_option( 'knabbel_version' );
 
 // Clean up any remaining Action Scheduler jobs.
 if ( function_exists( 'as_unschedule_all_actions' ) ) {
-	as_unschedule_all_actions( 'knabbel_process_story', array(), 'zw-knabbel-wp' );
-	as_unschedule_all_actions( 'knabbel_retry_story_sync', array(), 'zw-knabbel-wp' );
+	// Hook-only cancellation: a group or empty args would only match actions without per-post args.
+	as_unschedule_all_actions( 'knabbel_process_story' );
+	as_unschedule_all_actions( 'knabbel_retry_story_sync' );
 	as_unschedule_all_actions( 'knabbel_sync_few_shot_examples', array(), 'zw-knabbel-wp' );
 }
 

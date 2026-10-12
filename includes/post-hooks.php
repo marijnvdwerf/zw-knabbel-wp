@@ -250,6 +250,8 @@ function with_pending_story_update( array $state, string $title, ?array $update_
  * Runs from Action Scheduler and from the editor's "Sync again" action. It
  * works from state rather than from the failed operation, so it never sends
  * what the post no longer wants. It never creates a story or generates text.
+ * An update error without pending fields, recorded before they existed, gets
+ * the full payload based on the post date.
  *
  * @since 0.9.0
  *
@@ -259,7 +261,8 @@ function retry_story_sync( int $post_id ): void {
 	$post     = get_post( $post_id );
 	$state    = get_story_state( $post_id );
 	$story_id = (string) ( $state['story_id'] ?? '' );
-	if ( ! $post || 'post' !== $post->post_type || '' === $story_id || null === get_story_sync_error( $state ) ) {
+	$error    = get_story_sync_error( $state );
+	if ( ! $post || 'post' !== $post->post_type || '' === $story_id || null === $error ) {
 		return;
 	}
 
@@ -278,6 +281,10 @@ function retry_story_sync( int $post_id ): void {
 	}
 
 	$update_data = with_pending_story_update( $state, $post->post_title, null );
+	if ( null === $update_data && in_array( $error['operation'], array( 'update', 'restore' ), true ) ) {
+		// An error recorded before pending updates existed lists no fields: send the full payload.
+		$update_data = build_full_story_update( $post->post_title, $post->post_date );
+	}
 	if ( StoryStatus::Sent->value === $status && null !== $update_data ) {
 		push_story_update( $post_id, $story_id, $update_data, __( 'Story updated in Babbel', 'zw-knabbel-wp' ), 'sync_retry' );
 		return;
@@ -296,8 +303,18 @@ function retry_story_sync( int $post_id ): void {
  */
 function schedule_story_sync_retry( int $post_id ): void {
 	$args = array( 'post_id' => $post_id );
-	// A timestamp means a pending retry; true means only a running one, which may schedule its successor.
-	if ( is_int( \as_next_scheduled_action( STORY_SYNC_RETRY_HOOK, $args, 'zw-knabbel-wp' ) ) ) {
+	// Only a pending retry counts: a retry that is running right now schedules its successor.
+	$pending = \as_get_scheduled_actions(
+		array(
+			'hook'     => STORY_SYNC_RETRY_HOOK,
+			'args'     => $args,
+			'group'    => 'zw-knabbel-wp',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 1,
+		),
+		'ids'
+	);
+	if ( array() !== $pending ) {
 		return;
 	}
 
@@ -307,7 +324,10 @@ function schedule_story_sync_retry( int $post_id ): void {
 		return;
 	}
 
-	\as_schedule_single_action( time() + STORY_SYNC_RETRY_DELAYS[ $attempts ], STORY_SYNC_RETRY_HOOK, $args, 'zw-knabbel-wp' );
+	if ( ! \as_schedule_single_action( time() + STORY_SYNC_RETRY_DELAYS[ $attempts ], STORY_SYNC_RETRY_HOOK, $args, 'zw-knabbel-wp' ) ) {
+		log( 'error', 'PostHooks', 'Could not schedule a Babbel sync retry', array( 'post_id' => $post_id ) );
+		return;
+	}
 	update_story_state( $post_id, array( 'sync_retry_attempts' => $attempts + 1 ) );
 }
 
@@ -420,6 +440,14 @@ function restore_and_sync_story( int $post_id, string $story_id, string $title )
 function push_story_update( int $post_id, string $story_id, array $update_data, string $success_message, string $log_context ): void {
 	$result = babbel_update_story( $story_id, $update_data );
 	if ( $result['success'] ) {
+		// Another request may have recorded newer failed fields meanwhile; only clear what this request sent.
+		wp_cache_delete( $post_id, 'post_meta' );
+		$pending = get_pending_story_update( get_story_state( $post_id ) );
+		unset( $pending['title'] );
+		if ( ! empty( $pending ) && array_intersect_assoc( $pending, $update_data ) !== $pending ) {
+			update_story_state( $post_id, array( 'message' => $success_message ) );
+			return;
+		}
 		mark_story_synced( $post_id, array( 'message' => $success_message ) );
 	} else {
 		log(

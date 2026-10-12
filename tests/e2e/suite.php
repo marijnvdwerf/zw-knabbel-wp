@@ -931,6 +931,7 @@ final class Knabbel_E2E_Suite {
 		$title                      = 'E2E mislukte update';
 		list( $post_id, $story_id ) = $this->create_sent_story( $title, 'Babbel is even onbereikbaar terwijl de redactie de publicatiedatum aanpast.' );
 		$original                   = $this->get_babbel_story( $story_id );
+		$ai_calls                   = (int) get_option( 'knabbel_e2e_ai_call_count', 0 );
 
 		// A failed date change keeps every unsent field and schedules one retry.
 		$first_date = $this->past_post_date( 3 );
@@ -945,6 +946,8 @@ final class Knabbel_E2E_Suite {
 		);
 		$this->assert_same( 1, $this->sync_retry_count( $post_id ), 'A failed update must schedule exactly one retry.' );
 		$this->assert_same( 1, $state['sync_retry_attempts'] ?? null, 'The first retry must be counted.' );
+		$next_retry = as_next_scheduled_action( self::SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), self::ACTION_GROUP );
+		$this->assert_same( true, is_int( $next_retry ) && abs( $next_retry - ( time() + 300 ) ) <= 10, 'The first retry must wait five minutes.' );
 		$this->assert_same(
 			$original['start_date'] ?? null,
 			$this->get_babbel_story( $story_id )['start_date'] ?? null,
@@ -983,6 +986,41 @@ final class Knabbel_E2E_Suite {
 		$this->run_pending_sync_retry( $post_id );
 		$this->assert_story_window( $story_id, $third_date, 'The retry must send the pending dates.' );
 		$this->assert_synced( $post_id, 'A successful retry must clear the failure.' );
+
+		// A success that does not cover newer pending fields keeps them and their error.
+		KnabbelWP\update_story_state(
+			$post_id,
+			array(
+				'pending_update'  => array(
+					'start_date' => '2030-01-01',
+					'end_date'   => '2030-01-02',
+				),
+				'last_sync_error' => KnabbelWP\build_story_sync_error( 'E2E: a newer save failed', 'update' ),
+			)
+		);
+		KnabbelWP\push_story_update( $post_id, $story_id, array( 'title' => $title . ' hersteld' ), 'E2E', 'e2e_older_request' );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( '2030-01-01', 'E2E: a newer save failed' ),
+			array( $state['pending_update']['start_date'] ?? null, $state['last_sync_error']['message'] ?? null ),
+			'An older request must not clear newer pending fields.'
+		);
+		KnabbelWP\mark_story_synced( $post_id );
+
+		// An update error recorded before pending fields existed resends the full payload.
+		$stale_dates = KnabbelWP\calculate_story_dates( $this->future_post_date( 30 ) );
+		$this->babbel_request(
+			'PUT',
+			'/stories/' . $story_id,
+			array(
+				'start_date' => $stale_dates['start_date'],
+				'end_date'   => $stale_dates['end_date'],
+			)
+		);
+		KnabbelWP\update_story_state( $post_id, array( 'last_sync_error' => KnabbelWP\build_story_sync_error( 'E2E: an earlier version failed', 'update' ) ) );
+		KnabbelWP\retry_story_sync( $post_id );
+		$this->assert_story_window( $story_id, (string) get_post_field( 'post_date', $post_id ), 'A legacy update error must resend the window.' );
+		$this->assert_synced( $post_id, 'A legacy update retry must clear the failure.' );
 
 		// Retries stop after the configured number of attempts.
 		$this->set_babbel_writes_failing( true );
@@ -1026,6 +1064,7 @@ final class Knabbel_E2E_Suite {
 
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' hersteld' ), 'Retries must never create another story.' );
 		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Retries must never queue story generation.' );
+		$this->assert_same( $ai_calls, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Retries must never generate speech text.' );
 	}
 
 	/**
