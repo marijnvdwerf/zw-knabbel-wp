@@ -20,6 +20,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 const STORY_SYNC_RETRY_HOOK = 'knabbel_retry_story_sync';
 // Delays in seconds before each automatic retry of a failed sync; the count bounds the retries.
 const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
+// Seconds after which a sync lock counts as abandoned; longer than three Babbel requests of 30 seconds.
+const STORY_SYNC_LOCK_TTL = 120;
 
 /**
  * Registers post and metadata hooks.
@@ -89,6 +91,18 @@ function handle_post_saved( int $post_id, \WP_Post $post, bool $update, ?\WP_Pos
  * @param \WP_Post|null $post_before Post state before a save, when available.
  */
 function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
+	with_story_sync_lock( $post_id, static fn () => reconcile_story_state( $post_id, $post_before ) );
+}
+
+/**
+ * Reconciles story state while holding the post's sync lock.
+ *
+ * @since 0.9.0
+ *
+ * @param int           $post_id     Post ID.
+ * @param \WP_Post|null $post_before Post state before a save, when available.
+ */
+function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
 	$post = get_post( $post_id );
 	// Revisions and autosaves have post type 'revision', so this also excludes them.
 	if ( ! $post || 'post' !== $post->post_type ) {
@@ -258,6 +272,17 @@ function with_pending_story_update( array $state, string $title, ?array $update_
  * @param int $post_id Post ID.
  */
 function retry_story_sync( int $post_id ): void {
+	with_story_sync_lock( $post_id, static fn () => run_story_sync_retry( $post_id ) );
+}
+
+/**
+ * Retries a failed synchronization while holding the post's sync lock.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id Post ID.
+ */
+function run_story_sync_retry( int $post_id ): void {
 	$post     = get_post( $post_id );
 	$state    = get_story_state( $post_id );
 	$story_id = (string) ( $state['story_id'] ?? '' );
@@ -292,6 +317,102 @@ function retry_story_sync( int $post_id ): void {
 
 	// The failed operation is no longer wanted, so there is nothing left to sync.
 	mark_story_synced( $post_id );
+}
+
+/**
+ * Runs a callback while holding the post's sync lock.
+ *
+ * Syncs and retries of one post read the story state, talk to Babbel and
+ * write the result. The lock serializes them across requests, so an older
+ * result can never overwrite or clear what a newer sync recorded. A sync
+ * that cannot get the lock in time still runs, so a save is never dropped.
+ *
+ * @since 0.9.0
+ *
+ * @param int      $post_id  Post ID.
+ * @param callable $callback Work to run.
+ */
+function with_story_sync_lock( int $post_id, callable $callback ): void {
+	static $held = array();
+	if ( isset( $held[ $post_id ] ) ) {
+		$callback();
+		return;
+	}
+
+	$acquired = acquire_story_sync_lock( $post_id );
+	if ( ! $acquired ) {
+		log( 'error', 'PostHooks', 'Timed out waiting for another Babbel sync of this post; syncing anyway', array( 'post_id' => $post_id ) );
+	}
+
+	$held[ $post_id ] = true;
+	// Another request may have changed the state while this one waited.
+	wp_cache_delete( $post_id, 'post_meta' );
+	try {
+		$callback();
+	} finally {
+		unset( $held[ $post_id ] );
+		if ( $acquired ) {
+			release_story_sync_lock( $post_id );
+		}
+	}
+}
+
+/**
+ * Takes the post's sync lock, waiting while another request holds it.
+ *
+ * The lock is an options row: inserting it is atomic, so only one request
+ * can hold it. A row past its expiry belongs to a request that died.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id Post ID.
+ * @return bool True when the lock was taken.
+ */
+function acquire_story_sync_lock( int $post_id ): bool {
+	global $wpdb;
+
+	$name = 'knabbel_sync_lock_' . $post_id;
+	/**
+	 * Filters how long a sync waits for another sync of the same post.
+	 *
+	 * @since 0.9.0
+	 *
+	 * @param int $seconds Maximum wait in seconds.
+	 */
+	$deadline = microtime( true ) + (int) apply_filters( 'knabbel_sync_lock_wait', 60 );
+
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- An atomic insert is the lock; the options cache must not answer for it.
+	do {
+		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value < %d", $name, time() ) );
+		$inserted = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'off')",
+				$name,
+				(string) ( time() + STORY_SYNC_LOCK_TTL )
+			)
+		);
+		if ( 1 === $inserted ) {
+			return true;
+		}
+		usleep( 250000 );
+	} while ( microtime( true ) < $deadline );
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+	return false;
+}
+
+/**
+ * Releases the post's sync lock.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id Post ID.
+ */
+function release_story_sync_lock( int $post_id ): void {
+	global $wpdb;
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- See acquire_story_sync_lock().
+	$wpdb->delete( $wpdb->options, array( 'option_name' => 'knabbel_sync_lock_' . $post_id ) );
 }
 
 /**
@@ -440,14 +561,6 @@ function restore_and_sync_story( int $post_id, string $story_id, string $title )
 function push_story_update( int $post_id, string $story_id, array $update_data, string $success_message, string $log_context ): void {
 	$result = babbel_update_story( $story_id, $update_data );
 	if ( $result['success'] ) {
-		// Another request may have recorded newer failed fields meanwhile; only clear what this request sent.
-		wp_cache_delete( $post_id, 'post_meta' );
-		$pending = get_pending_story_update( get_story_state( $post_id ) );
-		unset( $pending['title'] );
-		if ( ! empty( $pending ) && array_intersect_assoc( $pending, $update_data ) !== $pending ) {
-			update_story_state( $post_id, array( 'message' => $success_message ) );
-			return;
-		}
 		mark_story_synced( $post_id, array( 'message' => $success_message ) );
 	} else {
 		log(

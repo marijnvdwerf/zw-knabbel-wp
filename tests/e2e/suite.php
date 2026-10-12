@@ -987,25 +987,76 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_window( $story_id, $third_date, 'The retry must send the pending dates.' );
 		$this->assert_synced( $post_id, 'A successful retry must clear the failure.' );
 
-		// A success that does not cover newer pending fields keeps them and their error.
-		KnabbelWP\update_story_state(
-			$post_id,
-			array(
-				'pending_update'  => array(
-					'start_date' => '2030-01-01',
-					'end_date'   => '2030-01-02',
-				),
-				'last_sync_error' => KnabbelWP\build_story_sync_error( 'E2E: a newer save failed', 'update' ),
-			)
-		);
-		KnabbelWP\push_story_update( $post_id, $story_id, array( 'title' => $title . ' hersteld' ), 'E2E', 'e2e_older_request' );
-		$state = KnabbelWP\get_story_state( $post_id );
+		// A sync holds the post's lock while it talks to Babbel and releases it afterwards.
+		$lock_held = null;
+		$observe   = function ( $preempt, array $args, string $url ) use ( &$lock_held, $post_id ) {
+			if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories' ) && 'PUT' === ( $args['method'] ?? '' ) ) {
+				$lock_held = $this->sync_lock_exists( $post_id );
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $observe, 1, 3 );
+		try {
+			$this->update_post( $post_id, array( 'post_title' => $title . ' vergrendeld' ) );
+		} finally {
+			remove_filter( 'pre_http_request', $observe, 1 );
+		}
+		$this->assert_same( true, $lock_held, 'A sync must hold the post lock while it writes to Babbel.' );
+		$this->assert_same( false, $this->sync_lock_exists( $post_id ), 'A sync must release the post lock.' );
+
+		// A lock left by a request that died is taken over.
+		$this->insert_sync_lock( $post_id, time() - 1 );
+		$this->update_post( $post_id, array( 'post_title' => $title . ' overgenomen' ) );
+		$this->assert_same( $title . ' overgenomen', $this->get_babbel_story( $story_id )['title'] ?? null, 'An expired lock must not block a sync.' );
+		$this->assert_same( false, $this->sync_lock_exists( $post_id ), 'Taking over an expired lock must release it afterwards.' );
+
+		// A sync that cannot get a held lock in time still runs, so no save is lost.
+		$this->insert_sync_lock( $post_id, time() + 60 );
+		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+		try {
+			$this->update_post( $post_id, array( 'post_title' => $title . ' hersteld' ) );
+		} finally {
+			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+			KnabbelWP\release_story_sync_lock( $post_id );
+		}
 		$this->assert_same(
-			array( '2030-01-01', 'E2E: a newer save failed' ),
-			array( $state['pending_update']['start_date'] ?? null, $state['last_sync_error']['message'] ?? null ),
-			'An older request must not clear newer pending fields.'
+			$title . ' hersteld',
+			$this->get_babbel_story( $story_id )['title'] ?? null,
+			'A sync must not be dropped when the lock stays busy.'
 		);
-		KnabbelWP\mark_story_synced( $post_id );
+		$this->assert_recent_error_logged( 'Timed out waiting for another Babbel sync of this post; syncing anyway', 'A lock timeout must be logged.' );
+
+		// A second failure while a retry is pending neither schedules nor counts another retry.
+		$this->set_babbel_writes_failing( true );
+		$this->set_post_date( $post_id, $this->past_post_date( 7 ) );
+		$this->set_post_date( $post_id, $this->past_post_date( 8 ) );
+		$this->set_babbel_writes_failing( false );
+		$this->assert_same(
+			array( 1, 1 ),
+			array( $this->sync_retry_count( $post_id ), KnabbelWP\get_story_state( $post_id )['sync_retry_attempts'] ?? null ),
+			'A pending retry must not be duplicated or counted twice.'
+		);
+		$this->update_post( $post_id, array() );
+		$this->assert_story_window( $story_id, $this->past_post_date( 8 ), 'The newest failed dates must win.' );
+		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
+
+		// A retry that cannot be scheduled is not counted.
+		$this->set_babbel_writes_failing( true );
+		add_filter( 'pre_as_schedule_single_action', '__return_zero' );
+		try {
+			$this->set_post_date( $post_id, $this->past_post_date( 9 ) );
+		} finally {
+			remove_filter( 'pre_as_schedule_single_action', '__return_zero' );
+			$this->set_babbel_writes_failing( false );
+		}
+		$this->assert_same(
+			array( 0, null ),
+			array( $this->sync_retry_count( $post_id ), KnabbelWP\get_story_state( $post_id )['sync_retry_attempts'] ?? null ),
+			'A retry that could not be scheduled must not be counted.'
+		);
+		$this->assert_recent_error_logged( 'Could not schedule a Babbel sync retry', 'A scheduling failure must be logged.' );
+		$this->update_post( $post_id, array() );
+		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
 
 		// An update error recorded before pending fields existed resends the full payload.
 		$stale_dates = KnabbelWP\calculate_story_dates( $this->future_post_date( 30 ) );
@@ -1097,6 +1148,50 @@ final class Knabbel_E2E_Suite {
 		}
 
 		return $preempt;
+	}
+
+	/**
+	 * Reports whether a post's sync lock row exists.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool True when the lock is held.
+	 */
+	private function sync_lock_exists( int $post_id ): bool {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The lock bypasses the options cache.
+		return null !== $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'knabbel_sync_lock_' . $post_id ) );
+	}
+
+	/**
+	 * Holds a post's sync lock as another request would.
+	 *
+	 * @param int $post_id    Post ID.
+	 * @param int $expires_at Unix time at which the lock counts as abandoned.
+	 */
+	private function insert_sync_lock( int $post_id, int $expires_at ): void {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+		$wpdb->insert(
+			$wpdb->options,
+			array(
+				'option_name'  => 'knabbel_sync_lock_' . $post_id,
+				'option_value' => (string) $expires_at,
+				'autoload'     => 'off',
+			)
+		);
+	}
+
+	/**
+	 * Asserts that a message is among the recent errors.
+	 *
+	 * @param string $error_message Logged message.
+	 * @param string $message       Failure message.
+	 */
+	private function assert_recent_error_logged( string $error_message, string $message ): void {
+		$messages = array_column( (array) get_option( 'knabbel_recent_errors', array() ), 'message' );
+		$this->assert_same( true, in_array( $error_message, $messages, true ), $message );
 	}
 
 	/**

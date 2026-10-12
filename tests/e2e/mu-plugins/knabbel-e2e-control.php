@@ -24,6 +24,25 @@ add_filter(
 	2
 );
 
+// Lets the browser suite make Babbel story writes fail, as when Babbel is unreachable.
+add_filter(
+	'pre_http_request',
+	static function ( false|array|WP_Error $preempt, array $args, string $url ): false|array|WP_Error {
+		$method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
+		if (
+			get_option( 'knabbel_e2e_fail_babbel_writes' )
+			&& str_contains( $url, '/api/v1/stories' )
+			&& in_array( $method, array( 'PUT', 'PATCH', 'DELETE' ), true )
+		) {
+			return new WP_Error( 'http_request_failed', 'E2E: Babbel is unreachable' );
+		}
+
+		return $preempt;
+	},
+	1,
+	3
+);
+
 /**
  * Runs due actions and fails on errors.
  *
@@ -94,6 +113,8 @@ add_action(
 			} catch ( Throwable $e ) {
 				wp_send_json_error( array( 'message' => $e->getMessage() ), 500 );
 			}
+		} elseif ( 'fail_writes' === $operation || 'restore_writes' === $operation ) {
+			update_option( 'knabbel_e2e_fail_babbel_writes', 'fail_writes' === $operation, false );
 		} elseif ( 'inspect' !== $operation ) {
 			wp_send_json_error( array( 'message' => 'Unsupported operation.' ), 400 );
 		}

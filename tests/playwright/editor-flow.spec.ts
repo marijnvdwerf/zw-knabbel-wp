@@ -119,6 +119,40 @@ test.describe
             expect(story.metadata?.wordpress_id).toBe(postID);
         });
 
+        test('redacteur slaat op en synchroniseert opnieuw na een Babbel-fout', async ({
+            page,
+        }) => {
+            await page.goto(`/wp-admin/post.php?post=${postID}&action=edit`);
+            await controlStory(page, postID, 'fail_writes');
+            try {
+                await page.locator('#title').fill(`${originalTitle} mislukt`);
+                await savePost(page);
+            } finally {
+                await controlStory(page, postID, 'restore_writes');
+            }
+            await expect(
+                page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
+            ).toBeVisible();
+            expect((await getBabbelStory(storyID)).title).toBe(originalTitle);
+
+            // An unsaved edit must survive the retry button.
+            const retriedTitle = `${originalTitle} opnieuw`;
+            await page.locator('#title').fill(retriedTitle);
+            await savePost(page, '.knabbel-sync-retry');
+
+            await expect(page.locator('#title')).toHaveValue(retriedTitle);
+            await expect(page.locator('#original_post_status')).toHaveValue(
+                'publish',
+            );
+            await expect(
+                page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
+            ).toHaveCount(0);
+            await expect(
+                page.locator('.knabbel-status-badge.sent'),
+            ).toBeVisible();
+            expect((await getBabbelStory(storyID)).title).toBe(retriedTitle);
+        });
+
         test('redacteur schakelt Babbel uit en herstelt daarna hetzelfde verhaal', async ({
             page,
         }) => {

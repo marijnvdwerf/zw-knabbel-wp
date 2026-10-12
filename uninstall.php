@@ -24,6 +24,11 @@ delete_option( 'knabbel_migration_status_changed_at' );
 delete_option( 'knabbel_few_shot_examples' );
 delete_option( 'knabbel_version' );
 
+// Remove sync locks left by requests that died while holding them.
+global $wpdb;
+// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One-time cleanup of uncached lock rows.
+$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'knabbel_sync_lock_' ) . '%' ) );
+
 // Clean up any remaining Action Scheduler jobs.
 if ( function_exists( 'as_unschedule_all_actions' ) ) {
 	// Hook-only cancellation: a group or empty args would only match actions without per-post args.

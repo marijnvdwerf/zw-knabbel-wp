@@ -77,7 +77,7 @@ export async function login(page: Page): Promise<void> {
     await expect(page).toHaveURL(/\/wp-admin\//);
 }
 
-export async function savePost(page: Page): Promise<void> {
+export async function savePost(page: Page, button = '#publish'): Promise<void> {
     const postResponse = page.waitForResponse(
         (response) =>
             response.request().method() === 'POST' &&
@@ -91,7 +91,8 @@ export async function savePost(page: Page): Promise<void> {
     const [response] = await Promise.all([
         postResponse,
         navigation,
-        page.locator('#publish').evaluate((button: HTMLInputElement) => {
+        page.locator(button).evaluate((element) => {
+            const button = element as HTMLButtonElement | HTMLInputElement;
             if (!button.form) {
                 throw new Error(
                     'The publish button is not associated with a form.',
@@ -138,7 +139,7 @@ export async function setBabbelEnabled(
 export async function controlStory(
     page: Page,
     postID: number,
-    operation: 'inspect' | 'run',
+    operation: 'inspect' | 'run' | 'fail_writes' | 'restore_writes',
 ): Promise<ControlResult> {
     const nonce = await page.locator('#knabbel_nonce').inputValue();
     const response = await page.request.post('/wp-admin/admin-ajax.php', {
