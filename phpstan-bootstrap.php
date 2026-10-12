@@ -85,9 +85,9 @@ if ( ! function_exists( 'as_next_scheduled_action' ) ) {
 	 * @param string $hook  The hook to check.
 	 * @param array  $args  Arguments to check against.
 	 * @param string $group The group to check.
-	 * @return int|false The timestamp of the next scheduled action, or false if none found.
+	 * @return int|bool The timestamp of the next pending action, true if only a running or unscheduled one exists, or false if none found.
 	 */
-	function as_next_scheduled_action( string $hook, array $args = array(), string $group = '' ): int|false {
+	function as_next_scheduled_action( string $hook, array $args = array(), string $group = '' ): int|bool {
 		return false;
 	}
 }

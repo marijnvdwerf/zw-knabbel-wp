@@ -27,6 +27,7 @@ function metabox_init(): void {
 	add_action( 'add_meta_boxes', __NAMESPACE__ . '\\metabox_add_status' );
 	add_action( 'save_post', __NAMESPACE__ . '\\metabox_save' );
 	add_action( 'admin_enqueue_scripts', __NAMESPACE__ . '\\metabox_enqueue_assets' );
+	add_action( 'admin_post_knabbel_retry_sync', __NAMESPACE__ . '\\metabox_retry_sync' );
 }
 
 /**
@@ -84,6 +85,10 @@ function submitbox_render( \WP_Post $post ): void {
 	$send_to_babbel = (bool) get_post_meta( $post->ID, '_zw_knabbel_send_to_babbel', true );
 	$state          = get_story_state( $post->ID );
 	$sync_error     = get_story_sync_error( $state );
+	$retry_url      = wp_nonce_url(
+		admin_url( 'admin-post.php?action=knabbel_retry_sync&post_id=' . $post->ID ),
+		'knabbel_retry_sync_' . $post->ID
+	);
 
 	wp_nonce_field( 'knabbel_metabox_nonce', 'knabbel_nonce' );
 	?>
@@ -106,6 +111,11 @@ function submitbox_render( \WP_Post $post ): void {
 			<div class="knabbel-sync-warning" role="alert">
 				<strong><?php esc_html_e( 'Babbel sync warning', 'zw-knabbel-wp' ); ?></strong>
 				<div><?php echo esc_html( $sync_error['message'] ); ?></div>
+				<?php if ( ! empty( $state['story_id'] ) && 'create' !== $sync_error['operation'] ) : ?>
+					<a class="button button-small knabbel-sync-retry" href="<?php echo esc_url( $retry_url ); ?>">
+						<?php esc_html_e( 'Sync again', 'zw-knabbel-wp' ); ?>
+					</a>
+				<?php endif; ?>
 			</div>
 		<?php endif; ?>
 	</div>
@@ -183,6 +193,25 @@ function metabox_render_status( \WP_Post $post ): void {
 			<?php endif; ?>
 		</ul>
 		<?php
+}
+
+/**
+ * Retries a failed Babbel synchronization from the editor.
+ *
+ * @since 0.9.0
+ */
+function metabox_retry_sync(): void {
+	$post_id = isset( $_GET['post_id'] ) ? absint( wp_unslash( $_GET['post_id'] ) ) : 0;
+	check_admin_referer( 'knabbel_retry_sync_' . $post_id );
+
+	if ( ! $post_id || ! current_user_can( 'edit_post', $post_id ) ) {
+		wp_die( esc_html__( 'Insufficient permissions', 'zw-knabbel-wp' ) );
+	}
+
+	retry_story_sync( $post_id );
+
+	wp_safe_redirect( get_edit_post_link( $post_id, 'url' ) ?? admin_url() );
+	exit;
 }
 
 /**

@@ -289,6 +289,7 @@ function log( string $level, string $component, string $message, array $context 
  * Triggers WordPress action hook for extensibility.
  *
  * @since 0.1.0
+ * @since 0.9.0 A null value removes any key, not only `last_sync_error`.
  * @param int                  $post_id The post ID.
  * @param array<string, mixed> $updates Partial state updates to apply.
  * @return bool True on successful update, false on failure.
@@ -313,9 +314,11 @@ function update_story_state( int $post_id, array $updates = array() ): bool {
 		$new_state['status_changed_at'] = current_time( 'mysql' );
 	}
 
-	// Null is an update-only sentinel: remove the error instead of persisting it.
-	if ( array_key_exists( 'last_sync_error', $updates ) && null === $updates['last_sync_error'] ) {
-		unset( $new_state['last_sync_error'] );
+	// Null is an update-only sentinel: remove the key instead of persisting it.
+	foreach ( $updates as $key => $value ) {
+		if ( null === $value ) {
+			unset( $new_state[ $key ] );
+		}
 	}
 
 	$success = update_post_meta( $post_id, '_zw_knabbel_story_state', $new_state );
@@ -568,6 +571,7 @@ function deactivate(): void {
 	// Clear Action Scheduler jobs. Hook-only takes the bulk-cancel path; passing
 	// args or a group forces an exact args match and would skip per-post actions.
 	\as_unschedule_all_actions( 'knabbel_process_story' );
+	\as_unschedule_all_actions( 'knabbel_retry_story_sync' );
 
 	// Clear few-shot sync schedule and cached data.
 	few_shot_unschedule_sync();

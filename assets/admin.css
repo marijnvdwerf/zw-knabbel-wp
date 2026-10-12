@@ -85,6 +85,10 @@
     margin-bottom: 3px;
 }
 
+.knabbel-sync-warning .knabbel-sync-retry {
+    margin-top: 6px;
+}
+
 /* ==========================================================================
    Publish box - Radionieuws control
    ========================================================================== */

@@ -23,6 +23,7 @@ if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
 final class Knabbel_E2E_Suite {
 	private const BABBEL_BASE_URL         = 'http://babbel:8080/api/v1';
 	private const STORY_HOOK              = 'knabbel_process_story';
+	private const SYNC_RETRY_HOOK         = 'knabbel_retry_story_sync';
 	private const FEW_SHOT_HOOK           = 'knabbel_sync_few_shot_examples';
 	private const ACTION_GROUP            = 'zw-knabbel-wp';
 	private const SEND_TO_BABBEL_META_KEY = '_zw_knabbel_send_to_babbel';
@@ -88,7 +89,8 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
 		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
 		$this->run_case( 'E2E-020', 'rescheduling moves the window and unpublishing deletes the story', $this->test_published_status_transitions( ... ) );
-		$this->run_case( 'E2E-021', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-021', 'failed syncs keep pending fields and retry within bounds', $this->test_failed_sync_retry( ... ) );
+		$this->run_case( 'E2E-022', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -920,6 +922,224 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( 'draft', get_post_status( $post_id ), 'Precondition: the post must be unpublished during generation.' );
 		$this->assert_same( array(), KnabbelWP\get_story_state( $post_id ), 'Unpublishing during generation must leave no story state.' );
 		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Unpublishing during generation must not create a story.' );
+	}
+
+	/**
+	 * Verifies pending fields, bounded retries and the retry decisions.
+	 */
+	private function test_failed_sync_retry(): void {
+		$title                      = 'E2E mislukte update';
+		list( $post_id, $story_id ) = $this->create_sent_story( $title, 'Babbel is even onbereikbaar terwijl de redactie de publicatiedatum aanpast.' );
+		$original                   = $this->get_babbel_story( $story_id );
+
+		// A failed date change keeps every unsent field and schedules one retry.
+		$first_date = $this->past_post_date( 3 );
+		$this->set_babbel_writes_failing( true );
+		$this->set_post_date( $post_id, $first_date );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'update' );
+		$this->assert_same(
+			array( 'title', 'start_date', 'end_date', 'weekdays' ),
+			array_keys( $state['pending_update'] ?? array() ),
+			'A failed full update must keep every unsent field.'
+		);
+		$this->assert_same( 1, $this->sync_retry_count( $post_id ), 'A failed update must schedule exactly one retry.' );
+		$this->assert_same( 1, $state['sync_retry_attempts'] ?? null, 'The first retry must be counted.' );
+		$this->assert_same(
+			$original['start_date'] ?? null,
+			$this->get_babbel_story( $story_id )['start_date'] ?? null,
+			'A failed update must leave Babbel unchanged.'
+		);
+
+		// A plain save after recovery sends the pending fields.
+		$this->set_babbel_writes_failing( false );
+		$this->update_post( $post_id, array() );
+		$this->assert_story_window( $story_id, $first_date, 'A plain save must send the pending dates.' );
+		$this->assert_synced( $post_id, 'A plain save that sends every pending field must clear the failure.' );
+
+		// A title-only change after a failure sends the pending dates as well.
+		$second_date = $this->past_post_date( 4 );
+		$this->set_babbel_writes_failing( true );
+		$this->set_post_date( $post_id, $second_date );
+		$this->set_babbel_writes_failing( false );
+		$this->update_post( $post_id, array( 'post_title' => $title . ' hersteld' ) );
+		$this->assert_same( $title . ' hersteld', $this->get_babbel_story( $story_id )['title'] ?? null, 'The title change must synchronize.' );
+		$this->assert_story_window( $story_id, $second_date, 'A title-only success must also send the pending dates.' );
+		$this->assert_synced( $post_id, 'A title-only success that sends the pending dates must clear the failure.' );
+
+		// A time-only change on a healthy post sends nothing.
+		$later_same_day = substr( $second_date, 0, 10 ) . ' 16:45:00';
+		$this->assert_same(
+			0,
+			$this->count_babbel_requests( fn () => $this->set_post_date( $post_id, $later_same_day ) ),
+			'A time-only change on a healthy post must not send a request.'
+		);
+
+		// The scheduled retry sends the pending fields once Babbel is reachable.
+		$third_date = $this->past_post_date( 5 );
+		$this->set_babbel_writes_failing( true );
+		$this->set_post_date( $post_id, $third_date );
+		$this->set_babbel_writes_failing( false );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_window( $story_id, $third_date, 'The retry must send the pending dates.' );
+		$this->assert_synced( $post_id, 'A successful retry must clear the failure.' );
+
+		// Retries stop after the configured number of attempts.
+		$this->set_babbel_writes_failing( true );
+		$this->set_post_date( $post_id, $this->past_post_date( 6 ) );
+		$max_attempts = count( KnabbelWP\STORY_SYNC_RETRY_DELAYS );
+		for ( $attempt = 1; $attempt < $max_attempts; ++$attempt ) {
+			$this->run_pending_sync_retry( $post_id );
+		}
+		$this->assert_same( $max_attempts, KnabbelWP\get_story_state( $post_id )['sync_retry_attempts'] ?? null, 'Every retry must be counted.' );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_same( 0, $this->sync_retry_count( $post_id ), 'No retry may be scheduled after the last attempt.' );
+		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'update' );
+
+		// A failed delete is retried as a delete while the post still wants none.
+		$this->set_babbel_writes_failing( false );
+		$this->update_post( $post_id, array() );
+		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
+		$this->set_babbel_writes_failing( true );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'delete' );
+		$this->set_babbel_writes_failing( false );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'The retry must delete the story.' );
+		$this->assert_synced( $post_id, 'A successful delete retry must clear the failure.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+
+		// A retry whose operation is no longer wanted sends nothing and clears the failure.
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: re-enabling must restore the story.' );
+		$this->set_babbel_writes_failing( true );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->set_babbel_writes_failing( false );
+		$this->assert_same(
+			0,
+			$this->count_babbel_requests( fn () => KnabbelWP\retry_story_sync( $post_id ) ),
+			'A retry for an unwanted delete must not send a request.'
+		);
+		$this->assert_synced( $post_id, 'A retry with nothing left to sync must clear the failure.' );
+		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $story_id );
+
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' hersteld' ), 'Retries must never create another story.' );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Retries must never queue story generation.' );
+	}
+
+	/**
+	 * Makes Babbel writes fail at the HTTP layer, as when Babbel is unreachable.
+	 *
+	 * Logins and reads still work, so repeated failures never trigger Babbel's
+	 * account lockout and the verification client can keep reading.
+	 *
+	 * @param bool $failing Whether writes must fail.
+	 */
+	private function set_babbel_writes_failing( bool $failing ): void {
+		remove_filter( 'pre_http_request', array( $this, 'fail_babbel_write' ), 1 );
+		if ( $failing ) {
+			add_filter( 'pre_http_request', array( $this, 'fail_babbel_write' ), 1, 3 );
+		}
+	}
+
+	/**
+	 * Fails Babbel story writes; see set_babbel_writes_failing().
+	 *
+	 * @param false|array<string, mixed>|WP_Error $preempt Short-circuit value.
+	 * @param array<string, mixed>                $args    Request arguments.
+	 * @param string                              $url     Request URL.
+	 * @return false|array<string, mixed>|WP_Error Short-circuit value.
+	 */
+	public function fail_babbel_write( false|array|WP_Error $preempt, array $args, string $url ): false|array|WP_Error {
+		$method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
+		if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories' ) && in_array( $method, array( 'PUT', 'PATCH', 'DELETE' ), true ) ) {
+			return new WP_Error( 'http_request_failed', 'E2E: Babbel is unreachable' );
+		}
+
+		return $preempt;
+	}
+
+	/**
+	 * Changes a post date without changing its status.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $date    Local MySQL datetime.
+	 */
+	private function set_post_date( int $post_id, string $date ): void {
+		$this->update_post(
+			$post_id,
+			array(
+				'post_date'     => $date,
+				'post_date_gmt' => get_gmt_from_date( $date ),
+				'edit_date'     => true,
+			)
+		);
+	}
+
+	/**
+	 * Returns a stable past local timestamp.
+	 *
+	 * @param int $days Days before now.
+	 * @return string MySQL datetime.
+	 */
+	private function past_post_date( int $days ): string {
+		return ( new DateTimeImmutable( 'now', wp_timezone() ) )->modify( sprintf( '-%d days', $days ) )->setTime( 12, 0 )->format( 'Y-m-d H:i:s' );
+	}
+
+	/**
+	 * Counts pending sync retries for a post.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return int Action count.
+	 */
+	private function sync_retry_count( int $post_id ): int {
+		return $this->action_count( self::SYNC_RETRY_HOOK, ActionScheduler_Store::STATUS_PENDING, array( 'post_id' => $post_id ) );
+	}
+
+	/**
+	 * Runs the one pending sync retry for a post before its due time.
+	 *
+	 * @param int $post_id Post ID.
+	 */
+	private function run_pending_sync_retry( int $post_id ): void {
+		$action_ids = as_get_scheduled_actions(
+			array(
+				'hook'     => self::SYNC_RETRY_HOOK,
+				'group'    => self::ACTION_GROUP,
+				'status'   => ActionScheduler_Store::STATUS_PENDING,
+				'args'     => array( 'post_id' => $post_id ),
+				'per_page' => -1,
+			),
+			'ids'
+		);
+		$this->assert_same( 1, count( $action_ids ), 'Exactly one sync retry must be pending.' );
+		ActionScheduler::runner()->process_action( (int) $action_ids[0], 'Knabbel E2E' );
+		$this->assert_same(
+			ActionScheduler_Store::STATUS_COMPLETE,
+			ActionScheduler::store()->get_status( (int) $action_ids[0] ),
+			'The sync retry action must complete.'
+		);
+	}
+
+	/**
+	 * Asserts that no sync failure, pending update or retry remains.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $message Failure message.
+	 */
+	private function assert_synced( int $post_id, string $message ): void {
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( null, null, null, 0 ),
+			array(
+				$state['last_sync_error'] ?? null,
+				$state['pending_update'] ?? null,
+				$state['sync_retry_attempts'] ?? null,
+				$this->sync_retry_count( $post_id ),
+			),
+			$message
+		);
 	}
 
 	/**
