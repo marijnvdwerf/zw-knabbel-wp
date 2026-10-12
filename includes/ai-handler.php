@@ -200,7 +200,7 @@ function ai_generate_content( string $content, int $current_post_id ): ?string {
 
 				$nonconforming = $result;
 				log(
-					'warning',
+					'error',
 					'AiHandler',
 					'Speech text breaks the default prompt form rules',
 					array(

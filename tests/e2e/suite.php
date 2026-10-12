@@ -875,54 +875,81 @@ final class Knabbel_E2E_Suite {
 		$too_long   = implode( ' ', array_fill( 0, 66, 'woord' ) ) . '.';
 		$paragraphs = "Eerste alinea van het bericht.\n\nTweede alinea van het bericht.";
 		$valid      = 'Een geldige radiotekst van één alinea.';
+		$settings   = get_option( 'knabbel_settings', array() );
 
-		update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $paragraphs, $valid ), false );
-		update_option( 'knabbel_e2e_ai_call_count', 0, false );
-		$this->assert_same(
-			$valid,
-			KnabbelWP\ai_generate_content( 'Een artikel voor de standaardprompt.', 0 ),
-			'Nonconforming default output must be retried.'
-		);
-		$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Each nonconforming output must cost one attempt.' );
-		$request_json = (string) wp_json_encode( get_option( 'knabbel_e2e_ai_last_request', array() ) );
-		$this->assert_same(
-			true,
-			str_contains( $request_json, 'Het is ' . wp_date( 'Y' ) . '.' ),
-			'The AI request must carry the current year in the site timezone.'
-		);
-
-		update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $too_long, $paragraphs ), false );
-		update_option( 'knabbel_e2e_ai_call_count', 0, false );
-		$this->assert_same(
-			$paragraphs,
-			KnabbelWP\ai_generate_content( 'Een artikel zonder geldige uitvoer.', 0 ),
-			'When no attempt conforms, the last generated text must be used.'
-		);
-		$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Nonconforming output must not exceed the retry limit.' );
-		$recent_errors = (string) wp_json_encode( get_option( 'knabbel_recent_errors', array() ) );
-		$this->assert_same(
-			true,
-			str_contains( $recent_errors, 'Text contains more than one paragraph' ),
-			'Using a nonconforming text must record the reason in recent errors.'
-		);
-
-		$settings                  = get_option( 'knabbel_settings', array() );
-		$settings['speech_prompt'] = 'Schrijf een uitgebreid radiobericht in meerdere alinea\'s.';
-		update_option( 'knabbel_settings', $settings );
-		update_option( 'knabbel_e2e_ai_outputs', array( $too_long ), false );
-		update_option( 'knabbel_e2e_ai_call_count', 0, false );
 		try {
+			delete_option( 'knabbel_recent_errors' );
+			update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $valid, 'Ongebruikte derde uitvoer.' ), false );
+			update_option( 'knabbel_e2e_ai_call_count', 0, false );
 			$this->assert_same(
-				$too_long,
+				$valid,
+				KnabbelWP\ai_generate_content( 'Een artikel voor de standaardprompt.', 0 ),
+				'Nonconforming default output must be retried.'
+			);
+			$this->assert_same( 2, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'A conforming retry must end the attempts.' );
+			$this->assert_same( array( 'Ongebruikte derde uitvoer.' ), get_option( 'knabbel_e2e_ai_outputs' ), 'The third output must stay unused.' );
+			$this->assert_recent_errors(
+				array(
+					array( 'Speech text breaks the default prompt form rules', 'Text has 66 words; the limit is 65' ),
+				),
+				'A rejected attempt must record its reason without a fallback error.'
+			);
+			$request_json = (string) wp_json_encode( get_option( 'knabbel_e2e_ai_last_request', array() ) );
+			$this->assert_same(
+				true,
+				str_contains( $request_json, 'Het is ' . wp_date( 'Y' ) . '.' ),
+				'The AI request must carry the current year in the site timezone.'
+			);
+
+			delete_option( 'knabbel_recent_errors' );
+			update_option( 'knabbel_e2e_ai_outputs', array( $too_long, $too_long, $paragraphs ), false );
+			update_option( 'knabbel_e2e_ai_call_count', 0, false );
+			$this->assert_same(
+				$paragraphs,
+				KnabbelWP\ai_generate_content( 'Een artikel zonder geldige uitvoer.', 0 ),
+				'When no attempt conforms, the last generated text must be used.'
+			);
+			$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Nonconforming output must not exceed the retry limit.' );
+			$this->assert_recent_errors(
+				array(
+					array( 'Speech text breaks the default prompt form rules', 'Text has 66 words; the limit is 65' ),
+					array( 'Speech text breaks the default prompt form rules', 'Text has 66 words; the limit is 65' ),
+					array( 'Speech text breaks the default prompt form rules', 'Text contains more than one paragraph' ),
+					array( 'No attempt met the default prompt form rules; using the last generated text', 'Text contains more than one paragraph' ),
+				),
+				'Every rejected attempt and the fallback must record their reasons.'
+			);
+
+			$custom_output                    = $too_long . "\n\nTweede alinea van het eigen bericht.";
+			$custom_settings                  = $settings;
+			$custom_settings['speech_prompt'] = 'Schrijf een uitgebreid radiobericht in meerdere alinea\'s.';
+			update_option( 'knabbel_settings', $custom_settings );
+			update_option( 'knabbel_e2e_ai_outputs', array( $custom_output ), false );
+			update_option( 'knabbel_e2e_ai_call_count', 0, false );
+			$this->assert_same(
+				$custom_output,
 				KnabbelWP\ai_generate_content( 'Een artikel voor een eigen prompt.', 0 ),
 				'A custom prompt must not get the default limits.'
 			);
 			$this->assert_same( 1, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'A custom prompt must accept the first output.' );
 		} finally {
-			$settings['speech_prompt'] = '';
 			update_option( 'knabbel_settings', $settings );
 			delete_option( 'knabbel_e2e_ai_outputs' );
 		}
+	}
+
+	/**
+	 * Asserts the recent errors by message and stored reason.
+	 *
+	 * @param array<int, array{0: string, 1: string}> $expected Expected message and reason pairs, oldest first.
+	 * @param string                                  $message  Failure message.
+	 */
+	private function assert_recent_errors( array $expected, string $message ): void {
+		$actual = array_map(
+			static fn ( array $error ): array => array( $error['message'] ?? null, $error['context']['error'] ?? null ),
+			(array) get_option( 'knabbel_recent_errors', array() )
+		);
+		$this->assert_same( $expected, $actual, $message );
 	}
 
 	/**
