@@ -755,7 +755,7 @@ function process_story_async( int $post_id ): void {
 				'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
 				'generated_speech_text' => $speech_text,
 				'last_sync_error'       => null,
-				// What Babbel confirmed, and the window base a published story keeps.
+				// What Babbel confirmed, and when a published story went live.
 				'synced'                => array(
 					'title'      => $title,
 					'start_date' => $dates['start_date'],
@@ -763,7 +763,6 @@ function process_story_async( int $post_id ): void {
 					'weekdays'   => $dates['weekdays'],
 				),
 				'window_base'           => 'future' === $post->post_status ? null : $base_date,
-				'post_date_seen'        => $post->post_date,
 			)
 		);
 	} else {

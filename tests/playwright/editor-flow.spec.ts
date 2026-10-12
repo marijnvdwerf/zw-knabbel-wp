@@ -154,7 +154,11 @@ test.describe
             ).toBeVisible();
             expect((await getBabbelStory(storyID)).title).toBe(retriedTitle);
 
-            // A date-only edit must survive the retry button and move the window.
+            const windowStart = (
+                await getBabbelStory(storyID)
+            ).start_date?.slice(0, 10);
+            // A date-only edit must survive the retry button. Moving a published post to an earlier
+            // day never pulls its window before the moment the story went live.
             await failOneTitleSave(page, postID, `${retriedTitle} mislukt`);
             await page.locator('a.edit-timestamp').click();
             const date = new Date(
@@ -178,11 +182,8 @@ test.describe
             await expect(page.locator('#hidden_jj')).toHaveValue(
                 String(date.getUTCDate()).padStart(2, '0'),
             );
-            date.setUTCDate(date.getUTCDate() + 1);
             const story = await getBabbelStory(storyID);
-            expect(story.start_date?.slice(0, 10)).toBe(
-                date.toISOString().slice(0, 10),
-            );
+            expect(story.start_date?.slice(0, 10)).toBe(windowStart);
             await expect(
                 page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
             ).toHaveCount(0);

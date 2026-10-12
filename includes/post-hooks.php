@@ -108,6 +108,7 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
  * the story should contain follows from the post and its stored window base,
  * never from what a single save changed, so syncs that run late or out of
  * order still send the post as it is. The previous post only picks a message.
+ * WordPress untrashes a post as draft, so untrashing never restores a story.
  *
  * @since 0.9.0
  *
@@ -127,18 +128,10 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 	$status         = $state['status'] ?? '';
 	$story_id       = (string) ( $state['story_id'] ?? '' );
 	$active_status  = in_array( $post->post_status, array( 'publish', 'future' ), true );
-	$is_untrash     = null !== $post_before && 'trash' === $post_before->post_status && 'trash' !== $post->post_status;
 	$is_rescheduled = null !== $post_before && 'publish' === $post_before->post_status && 'future' === $post->post_status;
-	// Left publish/future for draft, pending or private; trash is handled separately. Without
-	// the previous post (checkbox events, retries, deferred syncs) any inactive post counts.
-	$is_deactivated = ! $active_status
-		&& ( null === $post_before || in_array( $post_before->post_status, array( 'publish', 'future' ), true ) );
-	// Status changed into publish/future, except the publish→future demotion.
-	$is_activated  = null !== $post_before
-		&& $active_status
-		&& $post_before->post_status !== $post->post_status
-		&& ! $is_rescheduled;
-	$should_remove = ! $send_to_babbel || 'trash' === $post->post_status || $is_deactivated;
+	// Only a published or scheduled post with Radio News enabled has a story; a draft,
+	// pending, private or trashed post has none, whatever the save before it did.
+	$should_remove = ! $send_to_babbel || ! $active_status;
 
 	if ( $should_remove ) {
 		if ( $story_id && in_array( $status, array( StoryStatus::Sent->value, StoryStatus::Error->value ), true ) ) {
@@ -166,14 +159,10 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 		return false;
 	}
 
-	$should_restore = $is_untrash || $is_activated || ( null === $post_before && $active_status );
-	if ( $story_id && StoryStatus::Deleted->value === $status && $should_restore ) {
+	// A wanted story that is deleted comes back, also when an earlier restore failed for good.
+	if ( $story_id && StoryStatus::Deleted->value === $status ) {
 		restore_and_sync_story( $post_id, $story_id, $post );
 		return true;
-	}
-
-	if ( ! $active_status ) {
-		return false;
 	}
 
 	$stable_statuses = array(
@@ -206,15 +195,17 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
  * Returns the story fields a post calls for.
  *
  * A scheduled post's window starts from its post date. A published post's
- * window keeps the base it got when the plugin first saw it published (the
- * publication or the moment Radio News was enabled), until an editor moves
- * the post to another calendar day; a time-only change never moves it (#23).
+ * window starts from the later of its post date and the moment its story went
+ * live: the publication, or enabling Radio News. Moving a published post to a
+ * later date moves the window; moving it earlier never pulls the window into
+ * the past. Both inputs are stored state, so the result never depends on the
+ * order in which saves are synced.
  *
  * @since 0.9.0
  *
  * @param \WP_Post             $post        The post.
  * @param array<string, mixed> $state       Story state data.
- * @param array<string, mixed> $bookkeeping Receives the window base and post date to store.
+ * @param array<string, mixed> $bookkeeping Receives the live moment to store.
  * @return array<string, mixed> Title, start and end date, and weekdays.
  *
  * @phpstan-param StoryState $state
@@ -222,27 +213,17 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
  * @phpstan-return StoryUpdateData
  */
 function desired_story_fields( \WP_Post $post, array $state, array &$bookkeeping ): array {
-	$seen = $state['post_date_seen'] ?? null;
 	if ( 'future' === $post->post_status ) {
-		$base        = $post->post_date;
-		$window_base = null;
-	} elseif ( is_string( $seen ) && substr( $seen, 0, 10 ) !== substr( $post->post_date, 0, 10 ) ) {
-		$base        = $post->post_date;
-		$window_base = $base;
-	} elseif ( is_string( $state['window_base'] ?? null ) ) {
-		$base        = $state['window_base'];
-		$window_base = $base;
-	} else {
-		$base        = current_time( 'mysql' );
-		$window_base = $base;
+		// A later publication goes live again, so a scheduled story keeps no live moment.
+		$bookkeeping = array( 'window_base' => null );
+		return build_full_story_update( $post->post_title, $post->post_date );
 	}
 
-	$bookkeeping = array(
-		'window_base'    => $window_base,
-		'post_date_seen' => $post->post_date,
-	);
+	$live        = is_string( $state['window_base'] ?? null ) ? $state['window_base'] : current_time( 'mysql' );
+	$bookkeeping = array( 'window_base' => $live );
 
-	return build_full_story_update( $post->post_title, $base );
+	// Both are local MySQL datetimes, which compare chronologically as strings.
+	return build_full_story_update( $post->post_title, max( $post->post_date, $live ) );
 }
 
 /**
@@ -306,8 +287,11 @@ function story_fields_from_babbel( mixed $story ): ?array {
 /**
  * Sends what differs between the post and what Babbel last confirmed.
  *
- * A story synced before this snapshot existed is read from Babbel once. Its
- * current window then becomes the base, so upgrading never moves a window.
+ * A story synced before this snapshot existed, or whose last write may or may
+ * not have reached Babbel, is read from Babbel first. For a published story
+ * synced before, the fetched start date fixes the live moment, so upgrading
+ * keeps the start date; the end date follows the current settings, like every
+ * other window.
  *
  * @since 0.9.0
  *
@@ -339,11 +323,9 @@ function push_story_changes( int $post_id, string $story_id, \WP_Post $post, str
 			return true;
 		}
 
-		$migrated = array(
-			'synced'         => $synced,
-			'post_date_seen' => $post->post_date,
-		);
-		if ( 'publish' === $post->post_status ) {
+		$migrated = array( 'synced' => $synced );
+		// The fetched start date fixes the live moment; the end date follows the current settings.
+		if ( 'publish' === $post->post_status && ! is_string( $state['window_base'] ?? null ) ) {
 			$start_offset            = (int) get_plugin_settings()['start_days_offset'];
 			$base                    = ( new \DateTimeImmutable( $synced['start_date'], wp_timezone() ) )->modify( "-{$start_offset} day" );
 			$migrated['window_base'] = $base->format( 'Y-m-d H:i:s' );
@@ -695,6 +677,12 @@ function push_story_update( int $post_id, string $story_id, array $update_data, 
 			)
 		);
 		return;
+	}
+
+	// Without an HTTP 4xx answer the write may still have reached Babbel; read it before the next comparison.
+	$status_code = $result['status_code'] ?? 0;
+	if ( $status_code < 400 || $status_code >= 500 ) {
+		$bookkeeping['synced'] = null;
 	}
 
 	log(

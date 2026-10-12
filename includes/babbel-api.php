@@ -414,9 +414,10 @@ function babbel_test_connection(): array {
  *
  * @since 0.2.0
  * @since 0.8.0 Reports Problem Details errors.
+ * @since 0.9.0 Returns the HTTP status as `status_code` on an HTTP error.
  * @param string                                                                        $story_id   The Babbel story ID.
  * @param array{title?: string, start_date?: string, end_date?: string, weekdays?: int} $story_data The story data to update.
- * @return array{success: bool, message: string} Response with success status and message.
+ * @return array{success: bool, message: string, status_code?: int} Response with success status and message.
  *
  * @phpstan-param StoryUpdateData $story_data
  * @phpstan-return BabbelApiResponse
@@ -489,8 +490,9 @@ function babbel_update_story( string $story_id, array $story_data ): array {
 			)
 		);
 		return array(
-			'success' => false,
-			'message' => babbel_error_message( $response_code, $body ),
+			'success'     => false,
+			'message'     => babbel_error_message( $response_code, $body ),
+			'status_code' => $response_code,
 		);
 	}
 

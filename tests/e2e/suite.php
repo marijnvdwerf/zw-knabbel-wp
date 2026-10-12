@@ -83,7 +83,7 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-004', 'checkbox disable soft-deletes and re-enable restores', $this->test_checkbox_delete_and_restore( ... ) );
 		$this->run_case( 'E2E-005', 'scheduled post dates update when scheduled and published', $this->test_scheduled_story_lifecycle( ... ) );
 		$this->run_case( 'E2E-006', 'unscheduling cancels pending processing without creating a story', $this->test_pending_schedule_cancellation( ... ) );
-		$this->run_case( 'E2E-007', 'trash and untrash delete and restore the same story', $this->test_trash_and_restore( ... ) );
+		$this->run_case( 'E2E-007', 'trash deletes and untrash keeps the story deleted until publication', $this->test_trash_and_restore( ... ) );
 		$this->run_case( 'E2E-008', 'AI provider failure retries without creating a Babbel story', $this->test_ai_failure( ... ) );
 		$this->run_case( 'E2E-009', 'Babbel create failure is visible and preserves diagnostics safely', $this->test_babbel_create_failure( ... ) );
 		$this->run_case( 'E2E-010', 'few-shot queue learns editor changes', $this->test_few_shot_sync( ... ) );
@@ -524,10 +524,15 @@ final class Knabbel_E2E_Suite {
 		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
 
 		wp_untrash_post( $post_id );
+		$this->assert_same( 'draft', get_post_status( $post_id ), 'Precondition: WordPress untrashes a post as draft.' );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Untrashing to draft must not restore the story.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
 		$state = KnabbelWP\get_story_state( $post_id );
-		$this->assert_same( StoryStatus::Sent->value, $state['status'] ?? null, 'Untrash must restore the remote story.' );
-		$this->assert_same( $story_id, (string) ( $state['story_id'] ?? '' ), 'Untrash must retain the story ID.' );
-		$this->assert_same( 'E2E prullenbak', $this->get_babbel_story( $story_id )['title'] ?? null, 'Restored trash story must remain readable.' );
+		$this->assert_same( StoryStatus::Sent->value, $state['status'] ?? null, 'Publishing the untrashed post must restore the story.' );
+		$this->assert_same( $story_id, (string) ( $state['story_id'] ?? '' ), 'Restoring must retain the story ID.' );
+		$this->assert_same( 'E2E prullenbak', $this->get_babbel_story( $story_id )['title'] ?? null, 'The restored story must remain readable.' );
 	}
 
 	/**
@@ -938,8 +943,15 @@ final class Knabbel_E2E_Suite {
 	private function test_failed_sync_retry(): void {
 		$title                      = 'E2E mislukte update';
 		list( $post_id, $story_id ) = $this->create_sent_story( $title, 'Babbel is even onbereikbaar terwijl de redactie de publicatiedatum aanpast.' );
-		$original                   = $this->get_babbel_story( $story_id );
 		$ai_calls                   = (int) get_option( 'knabbel_e2e_ai_call_count', 0 );
+		$this->assert_same(
+			true,
+			is_string( KnabbelWP\get_story_state( $post_id )['window_base'] ?? null ),
+			'Creation must record when the story went live.'
+		);
+		// As if the story went live a month ago, so moving the post to an earlier day still moves the window.
+		KnabbelWP\update_story_state( $post_id, array( 'window_base' => $this->past_post_date( 30 ) ) );
+		$original = $this->get_babbel_story( $story_id );
 		$this->assert_same(
 			array( $this->date_only( $original['start_date'] ?? '' ), $this->date_only( $original['end_date'] ?? '' ) ),
 			array( KnabbelWP\get_story_state( $post_id )['synced']['start_date'] ?? null, KnabbelWP\get_story_state( $post_id )['synced']['end_date'] ?? null ),
@@ -953,11 +965,7 @@ final class Knabbel_E2E_Suite {
 		$this->set_babbel_writes_failing( false );
 		$state = KnabbelWP\get_story_state( $post_id );
 		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'update' );
-		$this->assert_same(
-			$this->date_only( $original['start_date'] ?? '' ),
-			$state['synced']['start_date'] ?? null,
-			'A failed update must not change the snapshot.'
-		);
+		$this->assert_same( false, isset( $state['synced'] ), 'A write that may have reached Babbel must drop the snapshot.' );
 		$this->assert_same( 1, $this->sync_retry_count( $post_id ), 'A failed update must schedule exactly one retry.' );
 		$this->assert_same( 1, $state['sync_retry_attempts'] ?? null, 'The first retry must be counted.' );
 		$next_retry = as_next_scheduled_action( self::SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), self::ACTION_GROUP );
@@ -1118,6 +1126,9 @@ final class Knabbel_E2E_Suite {
 			'A sync must send the post as stored, not a stale cached copy.'
 		);
 
+		// The story went live again after republishing; age it so earlier dates still move the window.
+		KnabbelWP\update_story_state( $post_id, array( 'window_base' => $this->past_post_date( 30 ) ) );
+
 		// A second failure while a retry is pending neither schedules nor counts another retry.
 		$this->set_babbel_writes_failing( true );
 		$this->set_post_date( $post_id, $this->past_post_date( 7 ) );
@@ -1149,30 +1160,6 @@ final class Knabbel_E2E_Suite {
 		$this->assert_recent_error_logged( 'Could not schedule a Babbel sync retry', 'A scheduling failure must be logged.' );
 		$this->update_post( $post_id, array() );
 		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
-
-		// A story synced before the snapshot existed is read from Babbel once and keeps its window.
-		$legacy_dates = KnabbelWP\calculate_story_dates( $this->past_post_date( 20 ) );
-		$this->babbel_request(
-			'PUT',
-			'/stories/' . $story_id,
-			array(
-				'start_date' => $legacy_dates['start_date'],
-				'end_date'   => $legacy_dates['end_date'],
-			)
-		);
-		$legacy_state = KnabbelWP\get_story_state( $post_id );
-		unset( $legacy_state['synced'], $legacy_state['window_base'], $legacy_state['post_date_seen'] );
-		$legacy_state['last_sync_error'] = KnabbelWP\build_story_sync_error( 'E2E: an earlier version failed', 'update' );
-		update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy_state );
-		$this->update_post( $post_id, array( 'post_title' => $title . ' gemigreerd' ) );
-		$story = $this->get_babbel_story( $story_id );
-		$this->assert_same( $title . ' gemigreerd', $story['title'] ?? null, 'A migrated story must get the title change.' );
-		$this->assert_same(
-			array( $legacy_dates['start_date'], $legacy_dates['end_date'] ),
-			array( $this->date_only( $story['start_date'] ?? '' ), $this->date_only( $story['end_date'] ?? '' ) ),
-			'Migrating must keep the window Babbel has.'
-		);
-		$this->assert_synced( $post_id, 'A migrated story in line with the post must clear a legacy error.' );
 
 		// Retries stop after the configured number of attempts.
 		$this->set_babbel_writes_failing( true );
@@ -1214,6 +1201,48 @@ final class Knabbel_E2E_Suite {
 		$this->assert_synced( $post_id, 'A retry with nothing left to sync must clear the failure.' );
 		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $story_id );
 
+		// A story synced before the snapshot existed is read from Babbel once. A start date later than the
+		// post date fixes when it went live, so the window stays; the end date follows the settings.
+		$legacy_state = KnabbelWP\get_story_state( $post_id );
+		$post_date    = (string) get_post_field( 'post_date', $post_id );
+		$kept         = KnabbelWP\calculate_story_dates( $this->past_post_date( 2 ) );
+		$this->babbel_request(
+			'PUT',
+			'/stories/' . $story_id,
+			array(
+				'start_date' => $kept['start_date'],
+				'end_date'   => $kept['end_date'],
+			)
+		);
+		unset( $legacy_state['synced'], $legacy_state['window_base'] );
+		$legacy_state['last_sync_error'] = KnabbelWP\build_story_sync_error( 'E2E: an earlier version failed', 'update' );
+		update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy_state );
+		$this->update_post( $post_id, array( 'post_title' => $title . ' gemigreerd' ) );
+		$story = $this->get_babbel_story( $story_id );
+		$this->assert_same( $title . ' gemigreerd', $story['title'] ?? null, 'A migrated story must get the title change.' );
+		$this->assert_same(
+			array( $kept['start_date'], $kept['end_date'] ),
+			array( $this->date_only( $story['start_date'] ?? '' ), $this->date_only( $story['end_date'] ?? '' ) ),
+			'Migrating must keep a window that started after the post date.'
+		);
+		$this->assert_synced( $post_id, 'A migrated story in line with the post must clear a legacy error.' );
+
+		// A start date before the post date means a date change never reached Babbel: migrating sends it.
+		$lost = KnabbelWP\calculate_story_dates( $this->past_post_date( 40 ) );
+		$this->babbel_request(
+			'PUT',
+			'/stories/' . $story_id,
+			array(
+				'start_date' => $lost['start_date'],
+				'end_date'   => $lost['end_date'],
+			)
+		);
+		$legacy_state = KnabbelWP\get_story_state( $post_id );
+		unset( $legacy_state['synced'], $legacy_state['window_base'] );
+		update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy_state );
+		KnabbelWP\retry_story_sync( $post_id );
+		$this->assert_story_window( $story_id, $post_date, 'Migrating must send a date change that never reached Babbel.' );
+
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' gemigreerd' ), 'Retries must never create another story.' );
 		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Retries must never queue story generation.' );
 		$this->assert_same( $ai_calls, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Retries must never generate speech text.' );
@@ -1238,8 +1267,6 @@ final class Knabbel_E2E_Suite {
 				array( 'ID' => $late_id )
 			);
 			clean_post_cache( $late_id );
-			// As if the story had been created with this date; a late cron run never changes it.
-			KnabbelWP\update_story_state( $late_id, array( 'post_date_seen' => $overdue ) );
 			$dates_before = KnabbelWP\calculate_story_dates( 'now' );
 			if ( $busy ) {
 				$this->insert_sync_lock( $late_id, time() + 60 );
