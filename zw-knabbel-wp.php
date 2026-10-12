@@ -830,23 +830,27 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 	// A token in the metadata identifies this attempt, and stays recorded until the attempt is
 	// settled: if its answer is lost, Babbel may have created the story anyway.
 	// The attempt counts as outstanding before it is recorded, as recording it fires a hook that may save.
+	// The token is also the idempotency key, so the request is kept to repeat it if its answer is lost.
 	$create_id                                   = wp_generate_uuid4();
 	$story_data['metadata']['knabbel_create_id'] = $create_id;
+	$story_data['idempotency_key']               = $create_id;
+	$pending                                     = array(
+		'id'          => $create_id,
+		'since'       => time(),
+		'window_base' => 'future' === $post->post_status ? null : $base_date,
+		'speech_text' => $speech_text,
+		'request'     => $story_data,
+	);
 	story_create_in_flight( $post_id, true );
 	try {
-		$recorded = update_story_state(
-			$post_id,
-			array(
-				'pending_create' => array(
-					'id'          => $create_id,
-					'since'       => time(),
-					'window_base' => 'future' === $post->post_status ? null : $base_date,
-					'speech_text' => $speech_text,
-				),
-			)
-		);
 		// An attempt that could not be recorded could never be found again if its answer were lost.
-		$result = $recorded ? babbel_create_story( $story_data ) : null;
+		$result = update_story_state( $post_id, array( 'pending_create' => $pending ) ) ? babbel_create_story( $story_data ) : null;
+		// Babbel v0.17.0 rejects the key without creating anything; the attempt is then found by its token.
+		if ( ! empty( $result['unsupported'] ) ) {
+			unset( $story_data['idempotency_key'], $pending['request'] );
+			$pending['since'] = time();
+			$result           = update_story_state( $post_id, array( 'pending_create' => $pending ) ) ? babbel_create_story( $story_data ) : null;
+		}
 	} finally {
 		story_create_in_flight( $post_id, false );
 	}

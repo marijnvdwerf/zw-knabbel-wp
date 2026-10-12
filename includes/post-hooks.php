@@ -1107,8 +1107,11 @@ function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
 /**
  * Settles a create attempt whose answer was lost.
  *
- * Babbel may have created the story anyway. It is looked up by the token the
- * attempt sent in its metadata and, when found, adopted as the post's story,
+ * Babbel may have created the story anyway. A Babbel version that keys creates
+ * gets the same request again, with the same key: it answers with the story
+ * the attempt made, or makes it now. Otherwise the story is looked up by the
+ * token the attempt sent in its metadata and, when found, adopted as the
+ * post's story,
  * so the post never gets a second one and the first does not stay behind with
  * an old window. When Babbel has none once the attempt can no longer commit,
  * nothing was created and a new attempt may follow; until then, and when the
@@ -1123,6 +1126,29 @@ function resolve_pending_create( int $post_id ): ?bool {
 	$pending = get_story_state( $post_id )['pending_create'] ?? null;
 	if ( ! is_array( $pending ) ) {
 		return false;
+	}
+
+	// Babbel answers a create repeated with the same idempotency key with the story the first one
+	// made, or makes it now: that settles the attempt without a lookup or a deadline.
+	if ( isset( $pending['request'] ) ) {
+		$replay = babbel_create_story( $pending['request'] );
+		if ( $replay['success'] ) {
+			return adopt_created_story( $post_id, $pending, (string) $replay['story_id'] );
+		}
+		if ( empty( $replay['unsupported'] ) ) {
+			// Babbel reads the key before it validates, so a rejected body means no story has the key.
+			if ( in_array( $replay['status_code'] ?? 0, array( 400, 422 ), true ) ) {
+				update_story_state( $post_id, array( 'pending_create' => null ) );
+				return false;
+			}
+			update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $replay['message'], 'create' ) ) );
+			schedule_story_sync_retry( $post_id );
+			schedule_story_sync_at( $post_id, time() + HOUR_IN_SECONDS );
+			return null;
+		}
+		// Babbel no longer takes the key: the attempt is looked up by its token instead.
+		unset( $pending['request'] );
+		update_story_state( $post_id, array( 'pending_create' => $pending ) );
 	}
 
 	// Only a lookup that starts once the attempt can no longer commit can prove there is no story.
@@ -1154,7 +1180,23 @@ function resolve_pending_create( int $post_id ): ?bool {
 		return false;
 	}
 
-	$story_id = (string) $story['id'];
+	return adopt_created_story( $post_id, $pending, (string) $story['id'], $story );
+}
+
+/**
+ * Adopts the story an unanswered create made as the post's story.
+ *
+ * @since 0.9.0
+ *
+ * @param int                  $post_id  Post ID.
+ * @param array<string, mixed> $pending  The pending create attempt.
+ * @param string               $story_id Babbel story ID.
+ * @param array<string, mixed> $story    The story as Babbel listed it, when known.
+ * @return true
+ *
+ * @phpstan-param PendingCreate $pending
+ */
+function adopt_created_story( int $post_id, array $pending, string $story_id, array $story = array() ): bool {
 	log(
 		'info',
 		'PostHooks',
@@ -1178,7 +1220,8 @@ function resolve_pending_create( int $post_id ): ?bool {
 			'window_base'           => $pending['window_base'],
 		)
 	);
-	// Deleted in Babbel since it was made: that deletion was made outside WordPress (#93).
+	// Deleted in Babbel since it was made: that deletion was made outside WordPress (#93). A story
+	// known only by its ID is checked by the next comparison, which records a deletion the same way.
 	if ( ! empty( $story['deleted_at'] ) ) {
 		record_story_gone( $post_id, $story_id, 'story.deleted', 'The created story was deleted in Babbel' );
 	}

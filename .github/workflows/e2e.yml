@@ -43,6 +43,9 @@ jobs:
           # Restores and updates in one request (oszuidwest/zwfm-babbel#342).
           - name: WordPress to Babbel (atomic restore)
             babbel_ref: 771f47a5a77911ec84d1cfa7c78e029ee73430d3
+          # Repeats a create with the same idempotency key safely (oszuidwest/zwfm-babbel#343).
+          - name: WordPress to Babbel (idempotent create)
+            babbel_ref: 7726558f40a69d7eaa37ce5afc22d3871f7e32fb
 
     steps:
       - name: Checkout plugin

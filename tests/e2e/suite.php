@@ -88,6 +88,13 @@ final class Knabbel_E2E_Suite {
 	private ?bool $atomic_restore = null;
 
 	/**
+	 * Whether Babbel accepts an idempotency key on create, once probed.
+	 *
+	 * @var bool|null
+	 */
+	private ?bool $idempotent_create = null;
+
+	/**
 	 * Executes all scenarios in dependency order.
 	 */
 	public function run(): void {
@@ -119,7 +126,17 @@ final class Knabbel_E2E_Suite {
 			fn () => $this->with_two_step_restore( $this->test_restore_window( ... ) )
 		);
 		$this->run_case( 'E2E-023', 'an embargoed story is never selectable for a bulletin before its window', $this->test_embargo_never_selectable( ... ) );
-		$this->run_case( 'E2E-024', 'a create whose answer was lost adopts the story Babbel made', $this->test_lost_create_answer( ... ) );
+		$this->run_case(
+			'E2E-024',
+			'a create whose answer was lost adopts the story Babbel made',
+			function () {
+				// The lookup by token, as with Babbel versions that do not key creates.
+				$this->with_unkeyed_create( $this->test_lost_create_answer( ... ) );
+				if ( $this->babbel_creates_idempotently() ) {
+					$this->check_keyed_create_replays();
+				}
+			}
+		);
 		$this->run_case( 'E2E-025', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
@@ -2445,6 +2462,131 @@ final class Knabbel_E2E_Suite {
 	}
 
 	/**
+	 * Reports whether Babbel accepts an idempotency key on create.
+	 *
+	 * Earlier versions reject the unknown member before validating; supporting
+	 * versions reject the empty body instead. Nothing is created either way.
+	 *
+	 * @return bool True when Babbel supports it.
+	 */
+	private function babbel_creates_idempotently(): bool {
+		if ( null === $this->idempotent_create ) {
+			$response                = $this->babbel_request( 'POST', '/stories', array( 'idempotency_key' => 'E2E probe' ) );
+			$this->idempotent_create = 422 === wp_remote_retrieve_response_code( $response );
+		}
+
+		return $this->idempotent_create;
+	}
+
+	/**
+	 * Runs a callback as if Babbel did not accept an idempotency key on create.
+	 *
+	 * Answers a create that carries a key as Babbel v0.17.0 does: 400 with an
+	 * unknown field, before anything is created.
+	 *
+	 * @param callable $callback The checks to run.
+	 */
+	private function with_unkeyed_create( callable $callback ): void {
+		$reject = static function ( $preempt, array $args, string $url ) {
+			$body = json_decode( (string) ( $args['body'] ?? '' ), true );
+			if ( 'POST' !== ( $args['method'] ?? '' ) || ! str_ends_with( $url, '/stories' ) || ! isset( $body['idempotency_key'] ) ) {
+				return $preempt;
+			}
+			return self::problem_response(
+				400,
+				'Bad Request',
+				array(
+					'title'  => 'Bad Request',
+					'status' => 400,
+					'detail' => 'Request body is not valid JSON for this endpoint',
+					'errors' => array(
+						array(
+							'field'   => 'idempotency_key',
+							'code'    => 'unknown_field',
+							'message' => 'unknown field',
+						),
+					),
+				)
+			);
+		};
+		add_filter( 'pre_http_request', $reject, 1, 3 );
+		try {
+			$callback();
+		} finally {
+			remove_filter( 'pre_http_request', $reject, 1 );
+		}
+	}
+
+	/**
+	 * Verifies creates repeated with the same idempotency key (#107).
+	 *
+	 * Babbel answers a repeat with the story the first create made, or makes it
+	 * now, so no lost answer can lead to a second story or a wait.
+	 */
+	private function check_keyed_create_replays(): void {
+		// The answer is lost: the repeat gets the story Babbel made.
+		$title     = 'E2E aanmaken met sleutel zonder antwoord';
+		$post_id   = $this->create_enabled_draft( $title, 'Babbel maakt het verhaal, maar het antwoord gaat verloren.' );
+		$lose_once = static function ( $response, array $args, string $url ) {
+			static $done = false;
+			if ( ! $done && 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) && ! is_wp_error( $response ) ) {
+				$done = true;
+				return new WP_Error( 'http_request_failed', 'E2E: the answer from Babbel was lost' );
+			}
+			return $response;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'http_response', $lose_once, 1, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'http_response', $lose_once, 1 );
+		}
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The repeat must adopt the story Babbel made.' );
+		$this->assert_same( false, isset( KnabbelWP\get_story_state( $post_id )['pending_create'] ), 'Nothing may stay pending.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// The request never reached Babbel: the repeat makes the story at once, without waiting.
+		$title    = 'E2E aanmaken met sleutel zonder verzoek';
+		$post_id  = $this->create_enabled_draft( $title, 'Het eerste verzoek komt nooit aan bij Babbel.' );
+		$no_reach = static function ( $preempt, array $args, string $url ) {
+			static $done = false;
+			if ( ! $done && 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
+				$done = true;
+				return new WP_Error( 'http_request_failed', 'E2E: the request never arrived' );
+			}
+			return $preempt;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $no_reach, 1, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $no_reach, 1 );
+		}
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The repeat must make the story at once.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'Exactly one story must exist.' );
+
+		// The repeat's answer is lost too, and the story is deleted in Babbel meanwhile: it is recorded
+		// as deleted in Babbel, never replaced.
+		$title   = 'E2E aanmaken met sleutel en verwijderd';
+		$post_id = $this->create_enabled_draft( $title, 'Het gemaakte verhaal wordt verwijderd voordat de plugin het hoort.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+			$this->assert_same( true, isset( KnabbelWP\get_story_state( $post_id )['pending_create'] ), 'Precondition: the attempt must stay pending.' );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+		}
+		$made = $this->babbel_get_json( '/stories?' . http_build_query( array( 'filter' => array( 'title' => $title ) ) ), 'The made story must be listed.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . ( $made['data'][0]['id'] ?? 0 ) );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A made story deleted in Babbel must be recorded as such.' );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'It must not be replaced.' );
+	}
+
+	/**
 	 * Runs a callback as if Babbel could only restore without fields.
 	 *
 	 * Answers a restore that carries fields as Babbel v0.17.0 does: 400 with an
@@ -2742,7 +2884,8 @@ final class Knabbel_E2E_Suite {
 		// The answer is lost before Babbel commits. Finding nothing proves nothing until the attempt can
 		// no longer commit, so a create that commits late is still adopted.
 		$no_reach = static function ( $preempt, array $args, string $url ) {
-			if ( 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
+			// An answer already decided by another filter, such as a simulated Babbel v0.17.0, stands.
+			if ( false === $preempt && 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
 				return new WP_Error( 'http_request_failed', 'E2E: the request never arrived' );
 			}
 			return $preempt;

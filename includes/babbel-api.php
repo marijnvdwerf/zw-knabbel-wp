@@ -221,8 +221,10 @@ function babbel_make_authenticated_request( string $url, array $args = array() )
  *
  * @since 0.1.0
  * @since 0.8.0 Reports Problem Details errors and requires an integer story ID.
+ * @since 0.9.0 Sends an idempotency key, and reports a Babbel version that rejects it as `unsupported`.
  * @param array<string, mixed> $story_data The story data to send.
- * @return array{success: bool, message: string, story_id?: string} Response with success status and message.
+ * @return array{success: bool, message: string, story_id?: string, status_code?: int, unsupported?: bool} Response with success
+ *         status and message.
  *
  * @phpstan-param StoryData $story_data
  * @phpstan-return BabbelApiResponse
@@ -243,6 +245,10 @@ function babbel_create_story( array $story_data ): array {
 	// Add metadata if provided.
 	if ( isset( $story_data['metadata'] ) ) {
 		$payload['metadata'] = $story_data['metadata'];
+	}
+	// A repeated create with the same key gets the story the first one made.
+	if ( isset( $story_data['idempotency_key'] ) ) {
+		$payload['idempotency_key'] = $story_data['idempotency_key'];
 	}
 
 	try {
@@ -299,10 +305,15 @@ function babbel_create_story( array $story_data ): array {
 				'response_body' => substr( $body, 0, 500 ),
 			)
 		);
+		$problem = json_decode( $body, true );
+		$codes   = is_array( $problem ) ? (array) ( $problem['errors'] ?? array() ) : array();
 		return array(
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			// Earlier Babbel versions reject the idempotency key, before creating anything.
+			'unsupported' => isset( $payload['idempotency_key'] ) && 400 === $response_code
+				&& in_array( 'unknown_field', array_column( array_filter( $codes, 'is_array' ), 'code' ), true ),
 		);
 	}
 
