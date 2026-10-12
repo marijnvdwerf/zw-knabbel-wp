@@ -135,7 +135,6 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 	$send_to_babbel = (bool) get_post_meta( $post_id, '_zw_knabbel_send_to_babbel', true );
 	$status         = $state['status'] ?? '';
 	$active_status  = in_array( $post->post_status, array( 'publish', 'future' ), true );
-	$is_rescheduled = null !== $post_before && 'publish' === $post_before->post_status && 'future' === $post->post_status;
 	// Only a published or scheduled post with Radio News enabled has a story; a draft,
 	// pending, private or trashed post has none, whatever the save before it did.
 	$should_remove = ! $send_to_babbel || ! $active_status;
@@ -190,9 +189,9 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 		return false;
 	}
 
-	if ( $is_rescheduled ) {
+	if ( 'publish' === $post_before?->post_status && 'future' === $post->post_status ) {
 		$message = __( 'Story updated (post rescheduled)', 'zw-knabbel-wp' );
-	} elseif ( null !== $post_before && 'future' === $post_before->post_status && 'publish' === $post->post_status ) {
+	} elseif ( 'future' === $post_before?->post_status && 'publish' === $post->post_status ) {
 		$message = __( 'Story updated (post published)', 'zw-knabbel-wp' );
 	} else {
 		$message = __( 'Story updated in Babbel', 'zw-knabbel-wp' );

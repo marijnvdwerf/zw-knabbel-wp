@@ -125,16 +125,7 @@ test.describe
             page,
         }) => {
             await page.goto(`/wp-admin/post.php?post=${postID}&action=edit`);
-            await controlStory(page, postID, 'fail_writes');
-            try {
-                await page.locator('#title').fill(`${originalTitle} mislukt`);
-                await savePost(page);
-            } finally {
-                await controlStory(page, postID, 'restore_writes');
-            }
-            await expect(
-                page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
-            ).toBeVisible();
+            await failOneTitleSave(page, postID, `${originalTitle} mislukt`);
             expect((await getBabbelStory(storyID)).title).toBe(originalTitle);
 
             // An unsaved edit must survive the retry button.

@@ -78,10 +78,9 @@ export async function login(page: Page): Promise<void> {
     await expect(page).toHaveURL(/\/wp-admin\//);
 }
 
-export async function savePost(page: Page, button = '#publish'): Promise<void> {
+export async function savePost(page: Page): Promise<void> {
     await submitPost(page, () =>
-        page.locator(button).evaluate((element) => {
-            const button = element as HTMLButtonElement | HTMLInputElement;
+        page.locator('#publish').evaluate((button: HTMLInputElement) => {
             if (!button.form) {
                 throw new Error(
                     'The publish button is not associated with a form.',
