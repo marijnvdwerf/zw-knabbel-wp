@@ -1152,7 +1152,7 @@ function resolve_pending_create( int $post_id ): ?bool {
 			if ( $found['success'] && 'missing' !== ( $found['found'] ?? '' ) ) {
 				return adopt_created_story( $post_id, $pending, (string) $replay['story_id'], (array) ( $found['story'] ?? array() ) );
 			}
-			$replay = array_merge( $found, array( 'message' => $found['success'] ? __( 'Invalid API response', 'zw-knabbel-wp' ) : $found['message'] ) );
+			$replay['message'] = $found['success'] ? __( 'Invalid API response', 'zw-knabbel-wp' ) : $found['message'];
 		} elseif ( ! empty( $replay['unsupported'] ) ) {
 			// Babbel no longer takes the key, so it never kept one: the attempt is looked up by its token.
 			unset( $pending['request'] );

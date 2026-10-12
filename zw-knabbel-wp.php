@@ -709,7 +709,7 @@ function prepare_story_processing( int $post_id ): ?\WP_Post {
 		return null;
 	}
 
-		$post = get_post( $post_id );
+	$post = get_post( $post_id );
 	if ( ! $post ) {
 		update_story_state(
 			$post_id,
@@ -815,6 +815,8 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 	$base_date = 'future' === $post->post_status ? $post->post_date : current_time( 'mysql' );
 	$dates     = calculate_story_dates( $base_date );
 
+	$window_base = 'future' === $post->post_status ? null : $base_date;
+
 	$story_data = array(
 		'title'      => $title,
 		'text'       => $speech_text,
@@ -830,7 +832,6 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 
 	// A token in the metadata identifies this attempt, and stays recorded until the attempt is
 	// settled: if its answer is lost, Babbel may have created the story anyway.
-	// The attempt counts as outstanding before it is recorded, as recording it fires a hook that may save.
 	// The token is also the idempotency key, so the request is kept to repeat it if its answer is lost.
 	$create_id                                   = wp_generate_uuid4();
 	$story_data['metadata']['knabbel_create_id'] = $create_id;
@@ -838,12 +839,13 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 	$pending                                     = array(
 		'id'          => $create_id,
 		'since'       => time(),
-		'window_base' => 'future' === $post->post_status ? null : $base_date,
+		'window_base' => $window_base,
 		'speech_text' => $speech_text,
 		'request'     => $story_data,
 	);
-	// The mark lasts until the outcome is recorded: a save in between, from a hook for example, waits,
-	// so it can neither settle the attempt early nor have its result overwritten.
+	// The attempt counts as outstanding before it is recorded, as recording it fires a hook that may
+	// save, and until its outcome is recorded: a save in between, from a hook for example, waits, so
+	// it can neither settle the attempt early nor have its result overwritten.
 	story_create_in_flight( $post_id, true );
 	try {
 		// An attempt that could not be recorded could never be found again if its answer were lost.
@@ -882,26 +884,26 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 						'end_date'   => $dates['end_date'],
 						'weekdays'   => $dates['weekdays'],
 					),
-					'window_base'           => 'future' === $post->post_status ? null : $base_date,
+					'window_base'           => $window_base,
 					'pending_create'        => null,
 				)
 			);
 		} else {
 			// An unanswered create may have made the story; a rejected one made nothing.
 			$adopted = babbel_write_uncertain( $result ) ? resolve_pending_create( $post_id ) : false;
-		}
-		if ( ! $result['success'] && true !== $adopted ) {
-			$error_state = array(
-				'status'  => \KnabbelWP\StoryStatus::Error->value,
-				'message' => $result['message'],
-			);
-			// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
-			if ( null !== $adopted ) {
-				$error_state['last_sync_error'] = build_story_sync_error( $result['message'], 'create' );
-				$error_state['pending_create']  = null;
+			if ( true !== $adopted ) {
+				$error_state = array(
+					'status'  => \KnabbelWP\StoryStatus::Error->value,
+					'message' => $result['message'],
+				);
+				// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
+				if ( null !== $adopted ) {
+					$error_state['last_sync_error'] = build_story_sync_error( $result['message'], 'create' );
+					$error_state['pending_create']  = null;
+				}
+				update_story_state( $post_id, $error_state );
+				return;
 			}
-			update_story_state( $post_id, $error_state );
-			return;
 		}
 	} finally {
 		story_create_in_flight( $post_id, false );
