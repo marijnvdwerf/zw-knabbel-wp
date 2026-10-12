@@ -17,7 +17,7 @@ Publishes selected WordPress posts as radio stories in the [Babbel API](https://
 - PHP 8.3 or 8.4
 - The [Classic Editor](https://wordpress.org/plugins/classic-editor/) plugin, installed and activated; the block editor is not supported
 - A compatible AI provider configured under **Settings > Connectors**
-- A running instance of the [Babbel API](https://github.com/oszuidwest/zwfm-babbel) v0.17.0 or later
+- A running instance of the [Babbel API](https://github.com/oszuidwest/zwfm-babbel) v0.17.0 or later. Babbel versions that restore a story and update it in one request ([zwfm-babbel#342](https://github.com/oszuidwest/zwfm-babbel/pull/342)) bring a restored story back with its new window at once, so a bulletin can never select it with its old window. With v0.17.0 the plugin parks deleted stories on no weekdays instead, and sends a new story when Babbel shows a deleted one unparked. One limit remains with v0.17.0: someone restoring, editing and deleting the story again in Babbel between the plugin's check and its restore. Use a Babbel version with the combined restore to rule that out.
 
 ## Setup
 

@@ -30,9 +30,19 @@ permissions:
 
 jobs:
   e2e:
-    name: WordPress to Babbel
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Restores in two requests; the plugin parks stories and falls back.
+          - name: WordPress to Babbel (v0.17.0)
+            babbel_ref: 0b7393b2bda9b3779f7b3747e077718ab0649435
+          # Restores and updates in one request (oszuidwest/zwfm-babbel#342).
+          - name: WordPress to Babbel (atomic restore)
+            babbel_ref: 771f47a5a77911ec84d1cfa7c78e029ee73430d3
 
     steps:
       - name: Checkout plugin
@@ -47,7 +57,7 @@ jobs:
           repository: oszuidwest/zwfm-babbel
           # Pull requests use a known-compatible contract. The weekly run follows
           # main so upstream compatibility regressions remain visible.
-          ref: ${{ github.event_name == 'schedule' && 'main' || '0b7393b2bda9b3779f7b3747e077718ab0649435' }}
+          ref: ${{ github.event_name == 'schedule' && 'main' || matrix.babbel_ref }}
           path: zwfm-babbel
           persist-credentials: false
 
@@ -103,10 +113,22 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: babbel-e2e-logs
+          name: babbel-e2e-logs-${{ strategy.job-index }}
           path: |
             zw-knabbel-wp/tests/e2e/artifacts/
             zw-knabbel-wp/playwright-report/
             zw-knabbel-wp/test-results/
           if-no-files-found: warn
           retention-days: 7
+
+  # The required check: passes only when the suite passes against every Babbel version.
+  e2e-result:
+    name: WordPress to Babbel
+    needs: e2e
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Babbel version to pass
+        env:
+          RESULT: ${{ needs.e2e.result }}
+        run: test "$RESULT" = success

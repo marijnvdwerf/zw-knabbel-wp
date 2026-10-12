@@ -415,8 +415,8 @@ function babbel_test_connection(): array {
  * @since 0.2.0
  * @since 0.8.0 Reports Problem Details errors.
  * @since 0.9.0 Returns the HTTP status as `status_code` on an HTTP error.
- * @param string                                                                        $story_id   The Babbel story ID.
- * @param array{title?: string, start_date?: string, end_date?: string, weekdays?: int} $story_data The story data to update.
+ * @param string                                                                                         $story_id   The Babbel story ID.
+ * @param array{title?: string, start_date?: string, end_date?: string, weekdays?: int, status?: string} $story_data The story data to update.
  * @return array{success: bool, message: string, status_code?: int} Response with success status and message.
  *
  * @phpstan-param StoryUpdateData $story_data
@@ -592,23 +592,29 @@ function babbel_delete_story( string $story_id ): array {
 /**
  * Restores a soft-deleted Babbel story.
  *
- * The PATCH endpoint only accepts 'status' and 'deleted_at' fields.
- * To update the title after restore, use babbel_update_story() separately.
+ * Babbel versions that support it restore the story and apply the given
+ * fields in one transaction, so it never comes back with its old fields.
+ * Earlier versions reject fields next to 'deleted_at' as unknown without
+ * restoring anything; that is reported as `unsupported`.
  *
  * @since 0.2.0
  * @since 0.8.0 Reports Problem Details errors.
- * @since 0.9.0 Returns the restored story as `story`, and the HTTP status as `status_code` on an HTTP error.
- * @param string $story_id The Babbel story ID.
- * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int} Response with success status and message.
+ * @since 0.9.0 Returns the restored story as `story`, the HTTP status as `status_code` on an HTTP error,
+ *              and accepts fields to apply with the restore.
+ * @param string               $story_id The Babbel story ID.
+ * @param array<string, mixed> $fields   Story fields to apply in the same request.
+ * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int, unsupported?: bool} Response with
+ *         success status and message.
  *
+ * @phpstan-param StoryUpdateData $fields
  * @phpstan-return BabbelApiResponse
  */
-function babbel_restore_story( string $story_id ): array {
+function babbel_restore_story( string $story_id, array $fields = array() ): array {
 	$credentials = babbel_get_credentials();
 	$endpoint    = $credentials['base_url'] . '/stories/' . $story_id;
 
 	// PATCH with deleted_at: "" (empty string) to restore.
-	$payload = array( 'deleted_at' => '' );
+	$payload = array_merge( array( 'deleted_at' => '' ), $fields );
 
 	try {
 		$json_body = wp_json_encode( $payload );
@@ -666,10 +672,14 @@ function babbel_restore_story( string $story_id ): array {
 				'response_body' => substr( $body, 0, 500 ),
 			)
 		);
+		$problem = json_decode( $body, true );
+		$codes   = array_column( array_filter( (array) ( is_array( $problem ) ? ( $problem['errors'] ?? array() ) : array() ), 'is_array' ), 'code' );
 		return array(
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			// Earlier Babbel versions reject fields next to deleted_at, before restoring anything.
+			'unsupported' => array() !== $fields && 400 === $response_code && in_array( 'unknown_field', $codes, true ),
 		);
 	}
 
@@ -690,6 +700,82 @@ function babbel_restore_story( string $story_id ): array {
 		'message' => __( 'Story restored successfully', 'zw-knabbel-wp' ),
 		// PATCH returns the restored story.
 		'story'   => is_array( $story ) ? $story : array(),
+	);
+}
+
+/**
+ * Looks up a story, including a soft-deleted one.
+ *
+ * GET /stories/{id} answers 404 for a deleted and a missing story alike. The
+ * list with `trashed=with` tells them apart through `deleted_at`.
+ *
+ * @since 0.9.0
+ * @param string $story_id The Babbel story ID.
+ * @return array{success: bool, message: string, found?: string, story?: array<string, mixed>} On success, `found` is
+ *         'live', 'deleted' or 'missing', with the story when it exists.
+ *
+ * @phpstan-return BabbelApiResponse
+ */
+function babbel_find_story( string $story_id ): array {
+	$credentials = babbel_get_credentials();
+	$endpoint    = add_query_arg(
+		rawurlencode_deep(
+			array(
+				'trashed'    => 'with',
+				'filter[id]' => $story_id,
+				'limit'      => 1,
+			)
+		),
+		$credentials['base_url'] . '/stories'
+	);
+
+	$response = babbel_make_authenticated_request(
+		$endpoint,
+		array(
+			'method'  => 'GET',
+			'timeout' => 30,
+		)
+	);
+	if ( is_wp_error( $response ) ) {
+		return array(
+			'success' => false,
+			'message' => __( 'API connection failed: ', 'zw-knabbel-wp' ) . $response->get_error_message(),
+		);
+	}
+
+	$response_code = wp_remote_retrieve_response_code( $response );
+	$body          = wp_remote_retrieve_body( $response );
+	if ( 200 !== $response_code ) {
+		return array(
+			'success'     => false,
+			'message'     => babbel_error_message( $response_code, $body ),
+			'status_code' => $response_code,
+		);
+	}
+
+	$decoded = json_decode( $body, true );
+	if ( ! is_array( $decoded ) || ! is_array( $decoded['data'] ?? null ) ) {
+		return array(
+			'success' => false,
+			'message' => __( 'Invalid API response', 'zw-knabbel-wp' ),
+		);
+	}
+
+	foreach ( $decoded['data'] as $story ) {
+		if ( is_array( $story ) && (string) ( $story['id'] ?? '' ) === $story_id ) {
+			return array(
+				'success' => true,
+				'message' => __( 'Story read successfully', 'zw-knabbel-wp' ),
+				'found'   => empty( $story['deleted_at'] ) ? 'live' : 'deleted',
+				'story'   => $story,
+			);
+		}
+	}
+
+	return array(
+		'success' => true,
+		'message' => __( 'Story read successfully', 'zw-knabbel-wp' ),
+		'found'   => 'missing',
 	);
 }
 

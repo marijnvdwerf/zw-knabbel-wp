@@ -20,9 +20,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 const STORY_SYNC_RETRY_HOOK = 'knabbel_retry_story_sync';
 // Delays in seconds before each automatic retry of a failed sync; the count bounds the retries.
 const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
-// Seconds after which a sync lock counts as abandoned. A sync makes at most three Babbel
-// calls, each with up to two logins and two requests of 30 seconds: 360 seconds.
-const STORY_SYNC_LOCK_TTL      = 600;
+// Seconds after which a sync lock counts as abandoned. A sync makes at most nine Babbel
+// calls (verify, combined restore, lookup, restore, read, status read, update, park, delete
+// again), each with up to two logins and two requests of 30 seconds: 1080 seconds.
+const STORY_SYNC_LOCK_TTL      = 1500;
 const STORY_SYNC_DEFERRED_HOOK = 'knabbel_deferred_story_sync';
 
 /**
@@ -170,7 +171,7 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 
 	// A wanted story that is deleted comes back, also when an earlier restore failed for good.
 	if ( $story_id && StoryStatus::Deleted->value === $status ) {
-		restore_and_sync_story( $post_id, $story_id, $post );
+		bring_back_deleted_story( $post_id, $story_id, $post );
 		return true;
 	}
 
@@ -197,7 +198,7 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 		$message = __( 'Story updated in Babbel', 'zw-knabbel-wp' );
 	}
 
-	return push_story_changes( $post_id, $story_id, $post, $message );
+	return null !== push_story_changes( $post_id, $story_id, $post, $message );
 }
 
 /**
@@ -303,13 +304,16 @@ function story_fields_from_babbel( mixed $story ): ?array {
  *
  * @since 0.9.0
  *
- * @param int      $post_id         Post ID.
- * @param string   $story_id        Babbel story ID.
- * @param \WP_Post $post            The post.
- * @param string   $success_message Translated message for the story state on success.
- * @return bool True when Babbel was called.
+ * @param int                  $post_id         Post ID.
+ * @param string               $story_id        Babbel story ID.
+ * @param \WP_Post             $post            The post.
+ * @param string               $success_message Translated message for the story state on success.
+ * @param array<string, mixed> $extra           Further fields to send in any case, such as a status.
+ * @return bool|null True when Babbel accepted the update, false when a request failed, null when no update was sent.
+ *
+ * @phpstan-param array{status?: string} $extra
  */
-function push_story_changes( int $post_id, string $story_id, \WP_Post $post, string $success_message ): bool {
+function push_story_changes( int $post_id, string $story_id, \WP_Post $post, string $success_message, array $extra = array() ): ?bool {
 	$state  = get_story_state( $post_id );
 	$synced = get_synced_story_fields( $state );
 	if ( null === $synced ) {
@@ -328,7 +332,7 @@ function push_story_changes( int $post_id, string $story_id, \WP_Post $post, str
 			);
 			update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $fetched['message'], 'update' ) ) );
 			schedule_story_sync_retry( $post_id );
-			return true;
+			return false;
 		}
 
 		$migrated = array( 'synced' => $synced );
@@ -345,10 +349,27 @@ function push_story_changes( int $post_id, string $story_id, \WP_Post $post, str
 
 	$bookkeeping = array();
 	$desired     = desired_story_fields( $post, $state, $bookkeeping );
-	if ( $desired === $synced ) {
+	if ( ! empty( $state['expired_reset'] ) ) {
+		// A restore whose update failed still owes an expired story its default status, if Babbel
+		// shows it expired now; an editor may have chosen another status meanwhile.
+		$current = babbel_get_story( $story_id );
+		if ( ! $current['success'] || ! is_string( $current['story']['status'] ?? null ) ) {
+			// Without Babbel's status the obligation stays, and nothing is sent yet.
+			$message = $current['success'] ? __( 'Invalid API response', 'zw-knabbel-wp' ) : $current['message'];
+			update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $message, 'update' ) ) );
+			schedule_story_sync_retry( $post_id );
+			return false;
+		}
+		if ( 'expired' === $current['story']['status'] && $desired['end_date'] >= wp_date( 'Y-m-d' ) ) {
+			$extra['status'] = (string) get_plugin_settings()['default_status'];
+		} else {
+			update_story_state( $post_id, array( 'expired_reset' => null ) );
+		}
+	}
+	if ( $desired === $synced && array() === $extra ) {
 		// Babbel already matches the post, so any earlier failure is moot.
 		mark_story_synced( $post_id, $bookkeeping );
-		return false;
+		return null;
 	}
 
 	// The window fields travel together, so Babbel never mixes two windows.
@@ -357,8 +378,7 @@ function push_story_changes( int $post_id, string $story_id, \WP_Post $post, str
 		$update_data = $desired;
 	}
 
-	push_story_update( $post_id, $story_id, $update_data, $success_message, $bookkeeping );
-	return true;
+	return push_story_update( $post_id, $story_id, array_merge( $update_data, $extra ), $success_message, $bookkeeping );
 }
 
 /**
@@ -682,20 +702,176 @@ function mark_story_synced( int $post_id, array $updates = array() ): void {
 				'last_sync_error'     => null,
 				'sync_retry_attempts' => null,
 				'remote_unverified'   => null,
+				'expired_reset'       => null,
 			)
 		)
 	);
 }
 
 /**
+ * Brings back a deleted story for a post that wants one again.
+ *
+ * Babbel restores a story before the update that gives it its new window, so
+ * only a story that Babbel shows parked on no weekdays is restored. Any other
+ * is left deleted, and the post gets a new story with a window from scratch.
+ * The deleted story is read first: no stored state proves what Babbel holds,
+ * since a lost answer, an edit in Babbel or Babbel's own defaults can all have
+ * changed it.
+ *
+ * @since 0.9.0
+ *
+ * @param int      $post_id  Post ID.
+ * @param string   $story_id Babbel story ID.
+ * @param \WP_Post $post     The post.
+ */
+function bring_back_deleted_story( int $post_id, string $story_id, \WP_Post $post ): void {
+	$atomic = restore_story_atomically( $post_id, $story_id, $post );
+	if ( true === $atomic ) {
+		return;
+	}
+
+	$found = babbel_find_story( $story_id );
+	if ( ! $found['success'] ) {
+		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $found['message'], 'restore' ) ) );
+		schedule_story_sync_retry( $post_id );
+		return;
+	}
+
+	$where  = $found['found'] ?? '';
+	$fields = story_fields_from_babbel( $found['story'] ?? null );
+	if ( 'missing' !== $where && null === $fields ) {
+		update_story_state(
+			$post_id,
+			array( 'last_sync_error' => build_story_sync_error( __( 'Could not read the deleted story from Babbel', 'zw-knabbel-wp' ), 'restore' ) )
+		);
+		schedule_story_sync_retry( $post_id );
+		return;
+	}
+
+	if ( 'live' === $where ) {
+		// Restored outside WordPress: nothing to restore, only to bring in line.
+		update_story_state(
+			$post_id,
+			array(
+				'status' => StoryStatus::Sent->value,
+				'synced' => $fields,
+			)
+		);
+		push_story_changes( $post_id, $story_id, $post, __( 'Story updated in Babbel', 'zw-knabbel-wp' ) );
+		return;
+	}
+
+	if ( 'deleted' === $where && false === $atomic ) {
+		// Babbel restores in one request but found nothing to restore, though the story shows as
+		// deleted now, as after a deletion right behind the restore: never fall back to two requests.
+		update_story_state(
+			$post_id,
+			array( 'last_sync_error' => build_story_sync_error( __( 'Could not restore the story in Babbel', 'zw-knabbel-wp' ), 'restore' ) )
+		);
+		schedule_story_sync_retry( $post_id );
+		return;
+	}
+
+	if ( 'deleted' === $where && 0 === ( $fields['weekdays'] ?? null ) ) {
+		restore_and_sync_story( $post_id, $story_id, $post );
+		return;
+	}
+
+	log(
+		'info',
+		'PostHooks',
+		'Deleted story is not parked or no longer exists; sending a new story instead of restoring it',
+		array(
+			'post_id'  => $post_id,
+			'story_id' => $story_id,
+			'found'    => $where,
+		)
+	);
+	delete_post_meta( $post_id, '_zw_knabbel_story_state' );
+	schedule_story_processing( $post_id );
+}
+
+/**
+ * Restores a story with its new window in one request.
+ *
+ * Babbel applies the restore and the fields in one transaction, so no
+ * bulletin can select the story with its old window, whatever the deleted
+ * story holds. The status stays an editorial choice, except that an expired
+ * story gets the default status when its new window is current.
+ *
+ * @since 0.9.0
+ *
+ * @param int      $post_id  Post ID.
+ * @param string   $story_id Babbel story ID.
+ * @param \WP_Post $post     The post.
+ * @return bool|null True when handled; false when Babbel restores in one request but answered that it has no such
+ *                   story; null when Babbel cannot restore with fields. In the last two cases nothing was recorded.
+ */
+function restore_story_atomically( int $post_id, string $story_id, \WP_Post $post ): ?bool {
+	$bookkeeping = array();
+	$desired     = desired_story_fields( $post, get_story_state( $post_id ), $bookkeeping );
+	$result      = babbel_restore_story( $story_id, $desired );
+	if ( ! empty( $result['unsupported'] ) ) {
+		return null;
+	}
+	// Earlier versions reject the fields before looking for the story, so a 404 proves support.
+	if ( 404 === ( $result['status_code'] ?? 0 ) ) {
+		return false;
+	}
+
+	if ( ! $result['success'] ) {
+		$uncertain = babbel_write_uncertain( $result );
+		update_story_state(
+			$post_id,
+			array(
+				'last_sync_error'   => build_story_sync_error( $result['message'], 'restore' ),
+				// The restore may still have applied, with the new window; read it before deciding again,
+				// and still give an expired story its default status if it did.
+				'remote_unverified' => $uncertain ? true : null,
+				'expired_reset'     => $uncertain ? true : null,
+			)
+		);
+		schedule_story_sync_retry( $post_id );
+		return true;
+	}
+
+	$story = $result['story'] ?? array();
+	mark_story_synced(
+		$post_id,
+		array_merge(
+			$bookkeeping,
+			array(
+				'status'  => StoryStatus::Sent->value,
+				'message' => __( 'Story restored in Babbel', 'zw-knabbel-wp' ),
+				// Babbel answered 200, so it committed the fields with the restore.
+				'synced'  => story_fields_from_babbel( $story ) ?? $desired,
+			)
+		)
+	);
+
+	// An expired or unreadable status owes the default status; the obligation is stored first, so a failed
+	// update keeps it, and the update decides against Babbel's status then.
+	if ( 'expired' === ( $story['status'] ?? null ) || ! is_string( $story['status'] ?? null ) ) {
+		update_story_state( $post_id, array( 'expired_reset' => true ) );
+	}
+	push_story_changes( $post_id, $story_id, $post, __( 'Story restored in Babbel', 'zw-knabbel-wp' ) );
+	return true;
+}
+
+/**
  * Restores a story and brings it in line with its post.
  *
  * Uses PATCH to restore (deleted_at), then sends what differs from the
- * restored story, because PATCH only accepts status or deleted_at.
+ * restored story, because PATCH only accepts status or deleted_at. The two
+ * requests are not atomic, so only a story parked on no weekdays is restored
+ * (see bring_back_deleted_story()), and the second follows immediately. When it fails, the story is deleted
+ * again, so it cannot stay live with its old window,
+ * and the restore is retried.
  *
  * @since 0.3.0
  * @since 0.9.0 Sends what differs from the restored story instead of only the
- *              title, and schedules a retry on failure.
+ *              title, deletes it again when that fails, gives an expired story
+ *              its default status back, and schedules a retry on failure.
  *
  * @param int      $post_id  The post ID.
  * @param string   $story_id The Babbel story ID.
@@ -708,24 +884,89 @@ function restore_and_sync_story( int $post_id, string $story_id, \WP_Post $post 
 			$post_id,
 			array(
 				'last_sync_error'   => build_story_sync_error( $result['message'], 'restore' ),
-				// The restore may still have reached Babbel; read it before deciding again.
+				// The restore may still have reached Babbel; read it before deciding again, and still
+				// give an expired story its default status if it did.
 				'remote_unverified' => babbel_write_uncertain( $result ) ? true : null,
+				'expired_reset'     => babbel_write_uncertain( $result ) ? true : null,
 			)
 		);
 		schedule_story_sync_retry( $post_id );
 		return;
 	}
 
-	// PATCH returns the restored story; without it, the next step reads it from Babbel.
+	// PATCH returns the restored story; if its answer lacks the fields, read the story instead.
+	$story = $result['story'] ?? array();
+	if ( null === story_fields_from_babbel( $story ) ) {
+		$fetched = babbel_get_story( $story_id );
+		$story   = $fetched['success'] ? ( $fetched['story'] ?? array() ) : array();
+	}
+	$fields = story_fields_from_babbel( $story );
+	update_story_state(
+		$post_id,
+		array_merge(
+			array(
+				'status'        => StoryStatus::Sent->value,
+				'message'       => __( 'Story restored in Babbel', 'zw-knabbel-wp' ),
+				// Without a readable status, the update reads it before deciding on the default status.
+				'expired_reset' => is_string( $story['status'] ?? null ) ? null : true,
+			),
+			// Without the fields, the next sync reads the story first; the snapshot never goes
+			// missing, which would make the story look like one from an earlier version.
+			null !== $fields ? array( 'synced' => $fields ) : array( 'remote_unverified' => true )
+		)
+	);
+
+	// The status is an editorial choice, except that an expired story gets the default status
+	// back when its new window is current. It is decided while restoring only.
+	$extra = array();
+	if ( 'expired' === ( $story['status'] ?? null ) ) {
+		$bookkeeping = array();
+		$desired     = desired_story_fields( $post, get_story_state( $post_id ), $bookkeeping );
+		if ( $desired['end_date'] >= wp_date( 'Y-m-d' ) ) {
+			$extra['status'] = (string) get_plugin_settings()['default_status'];
+		}
+	}
+
+	// Without the restored story's fields there is nothing safe to compare with: undo the restore.
+	if ( null !== $fields && false !== push_story_changes( $post_id, $story_id, $post, __( 'Story restored in Babbel', 'zw-knabbel-wp' ), $extra ) ) {
+		return;
+	}
+
+	// The story is live again with its old window, which may let it into bulletins too early.
+	$state         = get_story_state( $post_id );
+	$error_message = get_story_sync_error( $state )['message'] ?? __( 'Could not read the restored story from Babbel', 'zw-knabbel-wp' );
+	// A story that came back parked and whose update Babbel definitely rejected is still parked. An
+	// unanswered update may have given it its weekdays back, so then it is parked again first.
+	$still_parked = 0 === ( $fields['weekdays'] ?? null ) && empty( $state['remote_unverified'] );
+	$delete       = $still_parked ? babbel_delete_story( $story_id ) : park_and_delete_story( $post_id, $story_id );
+	// Whatever happens next, the restore is retried.
+	schedule_story_sync_retry( $post_id );
+	if ( $delete['success'] ) {
+		update_story_state(
+			$post_id,
+			array(
+				'status'            => StoryStatus::Deleted->value,
+				'message'           => __( 'Story could not be updated after restoring and was deleted again', 'zw-knabbel-wp' ),
+				'last_sync_error'   => build_story_sync_error( $error_message, 'restore' ),
+				'window_base'       => null,
+				'remote_unverified' => null,
+			)
+		);
+		return;
+	}
+
+	// Deleting failed too, so the story may still be live; the next sync checks and sends what still differs.
 	update_story_state(
 		$post_id,
 		array(
-			'status'  => StoryStatus::Sent->value,
-			'message' => __( 'Story restored in Babbel', 'zw-knabbel-wp' ),
-			'synced'  => story_fields_from_babbel( $result['story'] ?? null ),
+			'message'           => __( 'Story restored in Babbel, but updating it failed', 'zw-knabbel-wp' ),
+			// A decision still owed stays owed, against Babbel's status then: the default status for a
+			// story found expired, or one whose status could not be read yet. A made decision is final.
+			'expired_reset'     => isset( $extra['status'] ) || ! empty( $state['expired_reset'] ) ? true : null,
+			'last_sync_error'   => build_story_sync_error( $error_message, 'restore' ),
+			'remote_unverified' => babbel_write_uncertain( $delete ) ? true : ( $state['remote_unverified'] ?? null ),
 		)
 	);
-	push_story_changes( $post_id, $story_id, $post, __( 'Story restored in Babbel', 'zw-knabbel-wp' ) );
 }
 
 /**
@@ -745,13 +986,15 @@ function restore_and_sync_story( int $post_id, string $story_id, \WP_Post $post 
  * @param string               $success_message Translated message for the story state on success.
  * @param array<string, mixed> $bookkeeping     Window base and post date to store either way.
  *
+ * @return bool True when Babbel accepted the update.
+ *
  * @phpstan-param StoryUpdateData $update_data
  * @phpstan-param StoryStateUpdate $bookkeeping
  */
-function push_story_update( int $post_id, string $story_id, array $update_data, string $success_message, array $bookkeeping ): void {
+function push_story_update( int $post_id, string $story_id, array $update_data, string $success_message, array $bookkeeping ): bool {
 	$result = babbel_update_story( $story_id, $update_data );
 	if ( $result['success'] ) {
-		$synced = array_merge( get_synced_story_fields( get_story_state( $post_id ) ) ?? array(), $update_data );
+		$synced = array_merge( get_synced_story_fields( get_story_state( $post_id ) ) ?? array(), array_diff_key( $update_data, array( 'status' => true ) ) );
 		mark_story_synced(
 			$post_id,
 			array_merge(
@@ -762,12 +1005,18 @@ function push_story_update( int $post_id, string $story_id, array $update_data, 
 				)
 			)
 		);
-		return;
+		return true;
 	}
 
 	// The write may still have reached Babbel; read it before the next comparison.
 	if ( babbel_write_uncertain( $result ) ) {
 		$bookkeeping['remote_unverified'] = true;
+		// It may also have given a parked story its weekdays back, so the snapshot no longer counts
+		// it as parked: only a confirmed park or read records weekdays 0.
+		$synced = get_synced_story_fields( get_story_state( $post_id ) );
+		if ( null !== $synced && 0 !== ( $update_data['weekdays'] ?? 0 ) ) {
+			$bookkeeping['synced'] = array_merge( $synced, array( 'weekdays' => $update_data['weekdays'] ) );
+		}
 	}
 
 	log(
@@ -789,13 +1038,57 @@ function push_story_update( int $post_id, string $story_id, array $update_data, 
 		)
 	);
 	schedule_story_sync_retry( $post_id );
+	return false;
+}
+
+/**
+ * Deletes a story after parking it on no weekdays.
+ *
+ * Babbel keeps a soft-deleted story's fields, and restoring it (PATCH) brings
+ * it back before the update that gives it its new window. Babbel only puts a
+ * story in a bulletin on one of its weekdays, so a story parked on none
+ * cannot reach a bulletin in that moment. A story is only deleted once it is
+ * parked, or when Babbel already has no live story (404/410); otherwise the
+ * park's failure is returned as the delete's, so the caller retries.
+ *
+ * @since 0.9.0
+ *
+ * @param int    $post_id  Post ID.
+ * @param string $story_id Babbel story ID.
+ * @return array<string, mixed> Result of the delete, or of the park when parking failed.
+ *
+ * @phpstan-return BabbelApiResponse
+ */
+function park_and_delete_story( int $post_id, string $story_id ): array {
+	$park = babbel_update_story( $story_id, array( 'weekdays' => 0 ) );
+	if ( $park['success'] ) {
+		$synced = get_synced_story_fields( get_story_state( $post_id ) );
+		if ( null !== $synced ) {
+			update_story_state( $post_id, array( 'synced' => array_merge( $synced, array( 'weekdays' => 0 ) ) ) );
+		}
+	} elseif ( ! in_array( $park['status_code'] ?? 0, array( 404, 410 ), true ) ) {
+		// A story that may still be live is never deleted unparked; the caller retries.
+		log(
+			'error',
+			'PostHooks',
+			'Could not park the story on no weekdays; not deleting it yet',
+			array(
+				'post_id'  => $post_id,
+				'story_id' => $story_id,
+				'error'    => $park['message'],
+			)
+		);
+		return $park;
+	}
+
+	return babbel_delete_story( $story_id );
 }
 
 /**
  * Deletes a story and updates its local state.
  *
  * @since 0.5.0
- * @since 0.9.0 Schedules a retry on failure and drops the window base on success.
+ * @since 0.9.0 Parks the story on no weekdays first, schedules a retry on failure and drops the window base on success.
  *
  * @param int    $post_id         Post ID.
  * @param string $story_id        Babbel story ID.
@@ -803,7 +1096,7 @@ function push_story_update( int $post_id, string $story_id, array $update_data, 
  * @param string $log_context     Machine-readable context for failure logs.
  */
 function push_story_delete( int $post_id, string $story_id, string $success_message, string $log_context ): void {
-	$result = babbel_delete_story( $story_id );
+	$result = park_and_delete_story( $post_id, $story_id );
 	if ( $result['success'] ) {
 		// A later publication starts a new window, so the old base is dropped.
 		mark_story_synced(

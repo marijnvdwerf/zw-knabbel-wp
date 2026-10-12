@@ -31,7 +31,7 @@ project, removes it after the run, and writes combined container logs to
 
 ## Covered scenarios
 
-The scenario catalog (E2E-001 through E2E-022) lives in the `run()` method of
+The scenario catalog (E2E-001 through E2E-024) lives in the `run()` method of
 `suite.php`; the runner prints each scenario ID and title during execution.
 
 Before the PHP scenarios, Playwright drives the real WordPress admin UI in

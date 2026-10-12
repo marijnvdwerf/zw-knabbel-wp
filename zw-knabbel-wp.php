@@ -765,6 +765,8 @@ function process_story_async( int $post_id ): void {
 				'window_base'           => 'future' === $post->post_status ? null : $base_date,
 			)
 		);
+		// Saves during generation and creation found no story to update, so bring it in line now.
+		sync_story_state( $post_id );
 	} else {
 		update_story_state(
 			$post_id,
