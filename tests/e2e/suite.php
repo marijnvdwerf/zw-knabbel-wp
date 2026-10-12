@@ -985,19 +985,13 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_status( $retry_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
 		$reject_patch = static function ( $preempt, array $args, string $url ) {
 			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_contains( $url, '/stories/' ) ) {
-				return array(
-					'headers'  => array( 'content-type' => 'application/problem+json' ),
-					'body'     => wp_json_encode(
-						array(
-							'detail' => 'E2E: restoring is not allowed right now',
-							'code'   => 'auth.forbidden',
-						)
-					),
-					'response' => array(
-						'code'    => 403,
-						'message' => 'Forbidden',
-					),
-					'cookies'  => array(),
+				return self::problem_response(
+					403,
+					'Forbidden',
+					array(
+						'detail' => 'E2E: restoring is not allowed right now',
+						'code'   => 'auth.forbidden',
+					)
 				);
 			}
 			return $preempt;
@@ -1309,22 +1303,34 @@ final class Knabbel_E2E_Suite {
 		$forbid = static function ( array $methods ) {
 			return static function ( $preempt, array $args ) use ( $methods ) {
 				if ( in_array( $args['method'] ?? '', $methods, true ) ) {
-					return array(
-						'headers'  => array( 'content-type' => 'application/problem+json' ),
-						'body'     => wp_json_encode(
-							array(
-								'detail' => 'E2E: not allowed right now',
-								'code'   => 'auth.forbidden',
-							)
-						),
-						'response' => array(
-							'code'    => 403,
-							'message' => 'Forbidden',
-						),
-						'cookies'  => array(),
+					return self::problem_response(
+						403,
+						'Forbidden',
+						array(
+							'detail' => 'E2E: not allowed right now',
+							'code'   => 'auth.forbidden',
+						)
 					);
 				}
 				return $preempt;
+			};
+		};
+		// The lookup that includes deleted stories shows the story live, but without its fields.
+		$strip_lookup = static function ( string $story_id ) {
+			return static function ( $response, array $args, string $url ) use ( $story_id ) {
+				if ( is_array( $response ) && str_contains( $url, 'trashed=with' ) ) {
+					$response['body'] = (string) wp_json_encode(
+						array(
+							'data' => array(
+								array(
+									'id'         => (int) $story_id,
+									'deleted_at' => null,
+								),
+							),
+						)
+					);
+				}
+				return $response;
 			};
 		};
 
@@ -1427,21 +1433,7 @@ final class Knabbel_E2E_Suite {
 		$this->set_lost_babbel_responses( array( 'PUT' ) );
 		$this->update_post( $post_id, array( 'post_title' => 'E2E onvolledige opzoeking bewerkt' ) );
 		$this->set_lost_babbel_responses( array() );
-		$strip_list = static function ( $response, array $args, string $url ) use ( $story_id ) {
-			if ( is_array( $response ) && str_contains( $url, 'trashed=with' ) ) {
-				$response['body'] = (string) wp_json_encode(
-					array(
-						'data' => array(
-							array(
-								'id'         => (int) $story_id,
-								'deleted_at' => null,
-							),
-						),
-					)
-				);
-			}
-			return $response;
-		};
+		$strip_list = $strip_lookup( $story_id );
 		add_filter( 'http_response', $strip_list, 20, 3 );
 		try {
 			$this->update_post( $post_id, array() );
@@ -1468,21 +1460,7 @@ final class Knabbel_E2E_Suite {
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
 		$this->set_lost_babbel_responses( array() );
 		$this->assert_same( 'restore', KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'Precondition: the restore went unanswered.' );
-		$strip_this_list = static function ( $response, array $args, string $url ) use ( $story_id ) {
-			if ( is_array( $response ) && str_contains( $url, 'trashed=with' ) ) {
-				$response['body'] = (string) wp_json_encode(
-					array(
-						'data' => array(
-							array(
-								'id'         => (int) $story_id,
-								'deleted_at' => null,
-							),
-						),
-					)
-				);
-			}
-			return $response;
-		};
+		$strip_this_list = $strip_lookup( $story_id );
 		add_filter( 'http_response', $strip_this_list, 20, 3 );
 		try {
 			$this->run_pending_sync_retry( $post_id );

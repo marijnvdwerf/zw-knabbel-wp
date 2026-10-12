@@ -1132,10 +1132,10 @@ function restore_story_atomically( int $post_id, string $story_id, \WP_Post $pos
  */
 function restore_and_sync_story( int $post_id, string $story_id, \WP_Post $post ): void {
 	$result = babbel_restore_story( $story_id );
-	if ( ! $result['success'] && record_story_gone( $post_id, $story_id, $result['error_code'] ?? '', $result['message'] ) ) {
-		return;
-	}
 	if ( ! $result['success'] ) {
+		if ( record_story_gone( $post_id, $story_id, $result['error_code'] ?? '', $result['message'] ) ) {
+			return;
+		}
 		update_story_state(
 			$post_id,
 			array(
@@ -1190,13 +1190,12 @@ function restore_and_sync_story( int $post_id, string $story_id, \WP_Post $post 
 	}
 
 	// The update found the story gone again outside WordPress; that is recorded, nothing to undo.
-	$after = get_story_state( $post_id );
-	if ( in_array( $after['status'] ?? '', array( StoryStatus::DeletedInBabbel->value, StoryStatus::MissingInBabbel->value ), true ) ) {
+	$state = get_story_state( $post_id );
+	if ( in_array( $state['status'] ?? '', array( StoryStatus::DeletedInBabbel->value, StoryStatus::MissingInBabbel->value ), true ) ) {
 		return;
 	}
 
 	// The story is live again with its old window, which may let it into bulletins too early.
-	$state         = $after;
 	$error_message = get_story_sync_error( $state )['message'] ?? __( 'Could not read the restored story from Babbel', 'zw-knabbel-wp' );
 	// A story that came back parked and whose update Babbel definitely rejected is still parked. An
 	// unanswered update may have given it its weekdays back, so then it is parked again first.
