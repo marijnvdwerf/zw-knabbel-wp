@@ -624,6 +624,21 @@ function ajax_test_api(): void {
 }
 
 /**
+ * Reports whether a post already has a story, live or gone from Babbel.
+ *
+ * @since 0.9.0
+ * @param array<string, mixed> $state Story state data.
+ * @return bool True when creating another story would replace the existing one.
+ */
+function story_exists_for_post( array $state ): bool {
+	return in_array(
+		$state['status'] ?? '',
+		array( StoryStatus::Sent->value, StoryStatus::DeletedInBabbel->value, StoryStatus::MissingInBabbel->value ),
+		true
+	);
+}
+
+/**
  * Generates and sends a story through Action Scheduler.
  *
  * @since 0.1.0
@@ -641,9 +656,9 @@ function process_story_async( int $post_id ): void {
 
 	log( 'info', 'CronProcessor', 'Starting async story processing', array( 'post_id' => $post_id ) );
 
-	// Send-once safety: if already sent, do nothing.
+	// Send-once safety: a post that has a story, even one gone from Babbel, never gets another.
 	$existing_state = get_story_state( $post_id );
-	if ( isset( $existing_state['status'] ) && StoryStatus::Sent->value === $existing_state['status'] ) {
+	if ( story_exists_for_post( $existing_state ) ) {
 		log( 'info', 'CronProcessor', 'Story already sent — skipping', array( 'post_id' => $post_id ) );
 		return;
 	}
@@ -693,6 +708,15 @@ function process_story_async( int $post_id ): void {
 
 	// Generate speech text.
 	$speech_text = ai_generate_content( $content, $post_id );
+
+	// Generation takes a while: another request may have given the post a story meanwhile, and
+	// neither a new story nor an error state may replace it.
+	clean_post_cache( $post_id );
+	if ( story_exists_for_post( get_story_state( $post_id ) ) ) {
+		log( 'info', 'CronProcessor', 'A story appeared during processing — skipping', array( 'post_id' => $post_id ) );
+		return;
+	}
+
 	if ( null === $speech_text ) {
 		update_story_state(
 			$post_id,
@@ -704,8 +728,7 @@ function process_story_async( int $post_id ): void {
 		return;
 	}
 
-	// Generation takes a while: re-read the post so a change in the meantime is respected.
-	clean_post_cache( $post_id );
+	// Re-read the post, so a change made during generation is respected.
 	$post = get_post( $post_id );
 	if (
 		! $post

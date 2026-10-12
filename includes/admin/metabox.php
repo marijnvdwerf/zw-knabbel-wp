@@ -84,6 +84,11 @@ function submitbox_render( \WP_Post $post ): void {
 	$send_to_babbel = (bool) get_post_meta( $post->ID, '_zw_knabbel_send_to_babbel', true );
 	$state          = get_story_state( $post->ID );
 	$sync_error     = get_story_sync_error( $state );
+	$status         = $state['status'] ?? '';
+	$can_retry      = null !== $sync_error
+		&& ! empty( $state['story_id'] )
+		&& 'create' !== $sync_error['operation']
+		&& StoryStatus::MissingInBabbel->value !== $status;
 
 	wp_nonce_field( 'knabbel_metabox_nonce', 'knabbel_nonce' );
 	?>
@@ -106,7 +111,11 @@ function submitbox_render( \WP_Post $post ): void {
 			<div class="knabbel-sync-warning" role="alert">
 				<strong><?php esc_html_e( 'Babbel sync warning', 'zw-knabbel-wp' ); ?></strong>
 				<div><?php echo esc_html( $sync_error['message'] ); ?></div>
-				<?php if ( ! empty( $state['story_id'] ) && 'create' !== $sync_error['operation'] ) : ?>
+				<?php if ( StoryStatus::DeletedInBabbel->value === $status ) : ?>
+					<button type="submit" class="button button-small knabbel-sync-retry" name="knabbel_restore_story" value="1">
+						<?php esc_html_e( 'Save and restore in Babbel', 'zw-knabbel-wp' ); ?>
+					</button>
+				<?php elseif ( $can_retry ) : ?>
 					<button type="submit" class="button button-small knabbel-sync-retry" name="knabbel_retry_sync" value="1">
 						<?php esc_html_e( 'Save and sync again', 'zw-knabbel-wp' ); ?>
 					</button>
@@ -198,7 +207,7 @@ function metabox_render_status( \WP_Post $post ): void {
  * whole form, so no edit is lost, and retries a failed sync after the save.
  *
  * @since 0.1.0
- * @since 0.9.0 Handles "Save and sync again".
+ * @since 0.9.0 Handles "Save and sync again" and "Save and restore in Babbel".
  *
  * @param int $post_id The post ID being saved.
  */
@@ -232,13 +241,14 @@ function metabox_save( int $post_id ): void {
 	$send_to_babbel = isset( $_POST['knabbel_send_to_babbel'] ) ? 1 : 0;
 	update_post_meta( $post_id, '_zw_knabbel_send_to_babbel', $send_to_babbel );
 
-	if ( isset( $_POST['knabbel_retry_sync'] ) ) {
+	if ( isset( $_POST['knabbel_retry_sync'] ) || isset( $_POST['knabbel_restore_story'] ) ) {
+		$action = isset( $_POST['knabbel_restore_story'] ) ? __NAMESPACE__ . '\\restore_story_deleted_in_babbel' : __NAMESPACE__ . '\\retry_story_sync';
 		// After the regular sync of this save, which already sends any pending fields.
 		add_action(
 			'wp_after_insert_post',
-			static function ( int $saved_post_id ) use ( $post_id ): void {
+			static function ( int $saved_post_id ) use ( $post_id, $action ): void {
 				if ( $saved_post_id === $post_id ) {
-					retry_story_sync( $post_id );
+					$action( $post_id );
 				}
 			},
 			20

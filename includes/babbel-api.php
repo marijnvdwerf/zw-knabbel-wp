@@ -157,6 +157,18 @@ function babbel_error_message( int $code, string $body ): string {
 }
 
 /**
+ * Returns the machine-readable code of a Babbel error response.
+ *
+ * @since 0.9.0
+ * @param string $body Raw response body.
+ * @return string The Problem Details `code`, such as `story.deleted`, or '' when absent.
+ */
+function babbel_problem_code( string $body ): string {
+	$problem = json_decode( $body, true );
+	return is_array( $problem ) && is_string( $problem['code'] ?? null ) ? $problem['code'] : '';
+}
+
+/**
  * Sends an authenticated Babbel request.
  * Automatically retries with fresh session on 401 Unauthorized.
  *
@@ -414,10 +426,10 @@ function babbel_test_connection(): array {
  *
  * @since 0.2.0
  * @since 0.8.0 Reports Problem Details errors.
- * @since 0.9.0 Returns the HTTP status as `status_code` on an HTTP error.
+ * @since 0.9.0 Returns the HTTP status as `status_code` and the Problem Details code as `error_code` on an HTTP error.
  * @param string                                                                                         $story_id   The Babbel story ID.
  * @param array{title?: string, start_date?: string, end_date?: string, weekdays?: int, status?: string} $story_data The story data to update.
- * @return array{success: bool, message: string, status_code?: int} Response with success status and message.
+ * @return array{success: bool, message: string, status_code?: int, error_code?: string} Response with success status and message.
  *
  * @phpstan-param StoryUpdateData $story_data
  * @phpstan-return BabbelApiResponse
@@ -493,6 +505,7 @@ function babbel_update_story( string $story_id, array $story_data ): array {
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			'error_code'  => babbel_problem_code( $body ),
 		);
 	}
 
@@ -517,9 +530,9 @@ function babbel_update_story( string $story_id, array $story_data ): array {
  *
  * @since 0.2.0
  * @since 0.8.0 Accepts only HTTP 204 and reports Problem Details errors.
- * @since 0.9.0 Returns the HTTP status as `status_code` on an HTTP error.
+ * @since 0.9.0 Returns the HTTP status as `status_code` and the Problem Details code as `error_code` on an HTTP error.
  * @param string $story_id The Babbel story ID.
- * @return array{success: bool, message: string, status_code?: int} Response with success status and message.
+ * @return array{success: bool, message: string, status_code?: int, error_code?: string} Response with success status and message.
  *
  * @phpstan-return BabbelApiResponse
  */
@@ -570,6 +583,7 @@ function babbel_delete_story( string $story_id ): array {
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			'error_code'  => babbel_problem_code( $body ),
 		);
 	}
 
@@ -599,12 +613,12 @@ function babbel_delete_story( string $story_id ): array {
  *
  * @since 0.2.0
  * @since 0.8.0 Reports Problem Details errors.
- * @since 0.9.0 Returns the restored story as `story`, the HTTP status as `status_code` on an HTTP error,
- *              and accepts fields to apply with the restore.
+ * @since 0.9.0 Returns the restored story as `story`, the HTTP status as `status_code` and the Problem Details code as
+ *              `error_code` on an HTTP error, and accepts fields to apply with the restore.
  * @param string               $story_id The Babbel story ID.
  * @param array<string, mixed> $fields   Story fields to apply in the same request.
- * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int, unsupported?: bool} Response with
- *         success status and message.
+ * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int, error_code?: string, unsupported?: bool}
+ *         Response with success status and message.
  *
  * @phpstan-param StoryUpdateData $fields
  * @phpstan-return BabbelApiResponse
@@ -679,6 +693,7 @@ function babbel_restore_story( string $story_id, array $fields = array() ): arra
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			'error_code'  => babbel_problem_code( $body ),
 			// Earlier Babbel versions reject fields next to deleted_at, before restoring anything.
 			'unsupported' => array() !== $fields && 400 === $response_code && in_array( 'unknown_field', $codes, true ),
 		);
@@ -751,6 +766,7 @@ function babbel_find_story( string $story_id ): array {
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			'error_code'  => babbel_problem_code( $body ),
 		);
 	}
 
@@ -785,7 +801,7 @@ function babbel_find_story( string $story_id ): array {
  *
  * @since 0.9.0
  * @param string $story_id The Babbel story ID.
- * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int} Response with the decoded story on success.
+ * @return array{success: bool, message: string, story?: array<string, mixed>, status_code?: int, error_code?: string} The decoded story on success.
  *
  * @phpstan-return BabbelApiResponse
  */
@@ -814,6 +830,7 @@ function babbel_get_story( string $story_id ): array {
 			'success'     => false,
 			'message'     => babbel_error_message( $response_code, $body ),
 			'status_code' => $response_code,
+			'error_code'  => babbel_problem_code( $body ),
 		);
 	}
 

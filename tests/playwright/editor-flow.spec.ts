@@ -6,6 +6,7 @@ import {
     clickToSavePost,
     controlStory,
     currentPostID,
+    deleteBabbelStory,
     disposeBabbelContext,
     getBabbelStory,
     savePost,
@@ -201,6 +202,34 @@ test.describe
             await expect(
                 page.locator('.knabbel-status-badge.sent'),
             ).toBeVisible();
+        });
+
+        test('redacteur herstelt een verhaal dat buiten WordPress in Babbel is verwijderd', async ({
+            page,
+        }) => {
+            await page.goto(`/wp-admin/post.php?post=${postID}&action=edit`);
+            await deleteBabbelStory(storyID);
+            await page
+                .locator('#title')
+                .fill(`${originalTitle} na verwijdering`);
+            await savePost(page);
+            await expect(
+                page.locator('.knabbel-status-badge.deleted_in_babbel'),
+            ).toBeVisible();
+            expect(await babbelStoryStatus(storyID)).toBe(404);
+
+            const restoredTitle = `${originalTitle} hersteld`;
+            await page.locator('#title').fill(restoredTitle);
+            await clickToSavePost(page, 'button[name="knabbel_restore_story"]');
+
+            await expect(page.locator('#title')).toHaveValue(restoredTitle);
+            await expect(
+                page.locator('.knabbel-status-badge.sent'),
+            ).toBeVisible();
+            await expect(
+                page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
+            ).toHaveCount(0);
+            expect((await getBabbelStory(storyID)).title).toBe(restoredTitle);
         });
 
         test('redacteur schakelt Babbel uit en herstelt daarna hetzelfde verhaal', async ({

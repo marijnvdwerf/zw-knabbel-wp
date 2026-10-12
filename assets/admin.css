@@ -36,7 +36,9 @@
     color: #9a7b00;
 }
 
-.knabbel-status-badge.error {
+.knabbel-status-badge.error,
+.knabbel-status-badge.deleted_in_babbel,
+.knabbel-status-badge.missing_in_babbel {
     background: #fef7f7;
     border-color: #f5c2c2;
     color: #b11;
@@ -294,7 +296,9 @@
     color: #006818;
 }
 
-.knabbel-status-badge.error {
+.knabbel-status-badge.error,
+.knabbel-status-badge.deleted_in_babbel,
+.knabbel-status-badge.missing_in_babbel {
     background: #fcf0f1;
     color: #a02022;
 }

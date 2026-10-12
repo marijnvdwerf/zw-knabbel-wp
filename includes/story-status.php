@@ -28,6 +28,10 @@ enum StoryStatus: string {
 	case Sent       = 'sent';
 	case Error      = 'error';
 	case Deleted    = 'deleted';
+	// Deleted in Babbel outside WordPress; restored only on an editor's request.
+	case DeletedInBabbel = 'deleted_in_babbel';
+	// Babbel has no story with this ID; never created again automatically.
+	case MissingInBabbel = 'missing_in_babbel';
 
 	/**
 	 * Returns the translated display label.
@@ -43,6 +47,8 @@ enum StoryStatus: string {
 			self::Sent       => __( 'Sent', 'zw-knabbel-wp' ),
 			self::Error      => __( 'Error', 'zw-knabbel-wp' ),
 			self::Deleted    => __( 'Deleted', 'zw-knabbel-wp' ),
+			self::DeletedInBabbel => __( 'Deleted in Babbel', 'zw-knabbel-wp' ),
+			self::MissingInBabbel => __( 'Missing in Babbel', 'zw-knabbel-wp' ),
 		};
 	}
 }

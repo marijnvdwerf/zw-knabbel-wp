@@ -109,7 +109,7 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-016', 'untrash honors a disabled checkbox', $this->test_untrash_with_checkbox_disabled( ... ) );
 		$this->run_case( 'E2E-017', 'delete and restore failures remain retryable', $this->test_delete_and_restore_failures( ... ) );
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
-		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
+		$this->run_case( 'E2E-019', 'stories gone from Babbel are never restored or recreated on their own', $this->test_story_deleted_in_babbel( ... ) );
 		$this->run_case( 'E2E-020', 'rescheduling moves the window and unpublishing deletes the story', $this->test_published_status_transitions( ... ) );
 		$this->run_case( 'E2E-021', 'syncs compare with what Babbel confirmed, run one at a time and retry', $this->test_failed_sync_retry( ... ) );
 		// The two-step restore and its rollback, as with Babbel versions that cannot restore with fields.
@@ -870,23 +870,629 @@ final class Knabbel_E2E_Suite {
 	}
 
 	/**
-	 * Verifies an update to a story deleted outside WordPress.
+	 * Verifies stories deleted or missing in Babbel outside WordPress.
 	 */
 	private function test_story_deleted_in_babbel(): void {
+		$title                      = 'E2E buiten WordPress verwijderd';
 		list( $post_id, $story_id ) = $this->create_sent_story(
-			'E2E buiten WordPress verwijderd',
+			$title,
 			'Een redacteur verwijdert het verhaal in Babbel terwijl het bericht in WordPress gepubliceerd blijft.'
 		);
+		// As if the story went live a month ago with a window far from today, so a restore visibly gets a new one.
+		KnabbelWP\update_story_state( $post_id, array( 'window_base' => $this->past_post_date( 30 ) ) );
+		$this->set_stale_story_window( $story_id );
 		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
 
-		$this->update_post( $post_id, array( 'post_title' => 'E2E bewerking na verwijdering' ) );
-		$this->assert_sync_failure_preserved(
-			$post_id,
-			$story_id,
-			StoryStatus::Sent,
-			'update',
-			'API error: HTTP 410 - Story with id ' . $story_id . ' has been deleted'
+		// A 410 story.deleted is recorded as its own state, without retries.
+		$this->update_post( $post_id, array( 'post_title' => $title . ' bewerkt' ) );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same( StoryStatus::DeletedInBabbel->value, $state['status'] ?? null, 'A 410 must mark the story deleted in Babbel.' );
+		$this->assert_same(
+			'This story was deleted in Babbel outside WordPress. Restore it to bring it back with its audio and bulletin history.',
+			$state['last_sync_error']['message'] ?? null,
+			'A 410 must explain what happened.'
 		);
+		$this->assert_same( 0, $this->sync_retry_count( $post_id ), 'A 410 must not be retried.' );
+
+		// Nothing restores it on its own: neither saves nor the retry path.
+		$requests = $this->count_babbel_requests(
+			function () use ( $post_id, $title ) {
+				$this->update_post( $post_id, array( 'post_title' => $title . ' nogmaals' ) );
+				KnabbelWP\retry_story_sync( $post_id );
+			}
+		);
+		$this->assert_same( 0, $requests, 'A story deleted in Babbel must not be written to on its own.' );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'The retry path must keep the state.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+
+		// A story deleted in Babbel never gets a second story from a stale processing action.
+		KnabbelWP\process_story_async( $post_id );
+		$this->assert_same( $story_id, (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' ), 'Processing must keep the story ID.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title . ' nogmaals' ), 'Processing must not create another story.' );
+
+		// A worker whose generation fails while the story is deleted in Babbel leaves that state alone.
+		update_option( 'knabbel_e2e_ai_mode', 'error', false );
+		try {
+			KnabbelWP\update_story_state( $post_id, array( 'status' => StoryStatus::Processing->value ) );
+			$mark_gone = static function ( $preempt, array $args, string $url ) use ( $post_id ) {
+				if ( 'https://api.openai.com/v1/responses' === $url ) {
+					KnabbelWP\update_story_state( $post_id, array( 'status' => StoryStatus::DeletedInBabbel->value ) );
+				}
+				return $preempt;
+			};
+			add_filter( 'pre_http_request', $mark_gone, 5, 3 );
+			try {
+				KnabbelWP\process_story_async( $post_id );
+			} finally {
+				remove_filter( 'pre_http_request', $mark_gone, 5 );
+			}
+		} finally {
+			update_option( 'knabbel_e2e_ai_mode', 'success', false );
+		}
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A failed generation must not replace a story deleted in Babbel.' );
+
+		// The editor's restore brings back the same story with the current title and a new window.
+		$dates_before = KnabbelWP\calculate_story_dates( 'now' );
+		KnabbelWP\restore_story_deleted_in_babbel( $post_id );
+		$dates_after = KnabbelWP\calculate_story_dates( 'now' );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The restore action must restore the story.' );
+		$this->assert_synced( $post_id, 'A restore must clear the deleted-in-Babbel warning.' );
+		$story = $this->get_babbel_story( $story_id );
+		$this->assert_same( $title . ' nogmaals', $story['title'] ?? null, 'The restored story must get the current title.' );
+		$this->assert_story_dates_in_window( $story, $dates_before, $dates_after, 'The restored story must get the current window.' );
+
+		// Disabling Radio News on a story deleted in Babbel only updates the local state.
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->update_post( $post_id, array( 'post_title' => $title ) );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+		// Unpublishing and publishing again keeps the state, so nothing restores the story on its own.
+		$requests = $this->count_babbel_requests(
+			function () use ( $post_id ) {
+				$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
+				$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+			}
+		);
+		$this->assert_same( 0, $requests, 'Unpublishing and publishing again must not touch a story deleted in Babbel.' );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'Unpublishing must keep the deleted-in-Babbel state.' );
+		$requests = $this->count_babbel_requests( fn () => update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 ) );
+		$this->assert_same( 0, $requests, 'Disabling must not call Babbel for an already deleted story.' );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Disabling must end in the deleted state.' );
+		$this->assert_synced( $post_id, 'Disabling must clear the warning.' );
+
+		// An editor's restore that fails is kept and finished by the retry.
+		list( $retry_id, $retry_story_id ) = $this->create_sent_story(
+			'E2E herstel opnieuw geprobeerd',
+			'Het herstel van een buiten WordPress verwijderd verhaal mislukt eerst.'
+		);
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $retry_story_id );
+		$this->update_post( $retry_id, array( 'post_title' => 'E2E herstel opnieuw geprobeerd bewerkt' ) );
+		$this->set_failing_babbel_methods( array( 'PATCH' ) );
+		KnabbelWP\restore_story_deleted_in_babbel( $retry_id );
+		$this->set_failing_babbel_methods( array() );
+		$state = KnabbelWP\get_story_state( $retry_id );
+		$this->assert_same(
+			array( StoryStatus::DeletedInBabbel->value, true, 1 ),
+			array( $state['status'] ?? null, $state['restore_requested'] ?? null, $this->sync_retry_count( $retry_id ) ),
+			'A failed restore must keep the request and schedule a retry.'
+		);
+		$this->run_pending_sync_retry( $retry_id );
+		$this->assert_story_status( $retry_id, StoryStatus::Sent, 'The retry must finish the requested restore.' );
+		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $retry_story_id );
+
+		// An editor's restore that Babbel rejects outright (4xx) is kept and retried as well.
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $retry_story_id );
+		$this->update_post( $retry_id, array( 'post_title' => 'E2E herstel opnieuw geprobeerd na weigering' ) );
+		$this->assert_story_status( $retry_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+		$reject_patch = static function ( $preempt, array $args, string $url ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_contains( $url, '/stories/' ) ) {
+				return array(
+					'headers'  => array( 'content-type' => 'application/problem+json' ),
+					'body'     => wp_json_encode(
+						array(
+							'detail' => 'E2E: restoring is not allowed right now',
+							'code'   => 'auth.forbidden',
+						)
+					),
+					'response' => array(
+						'code'    => 403,
+						'message' => 'Forbidden',
+					),
+					'cookies'  => array(),
+				);
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $reject_patch, 1, 3 );
+		try {
+			KnabbelWP\restore_story_deleted_in_babbel( $retry_id );
+		} finally {
+			remove_filter( 'pre_http_request', $reject_patch, 1 );
+		}
+		$state = KnabbelWP\get_story_state( $retry_id );
+		$this->assert_same(
+			array( StoryStatus::DeletedInBabbel->value, true, null, 1 ),
+			array( $state['status'] ?? null, $state['restore_requested'] ?? null, $state['remote_unverified'] ?? null, $this->sync_retry_count( $retry_id ) ),
+			'A rejected restore must keep the request, need no verification and schedule a retry.'
+		);
+		$this->run_pending_sync_retry( $retry_id );
+		$this->assert_story_status( $retry_id, StoryStatus::Sent, 'The retry must finish the rejected restore.' );
+
+		// A deletion the update after a restore runs into is recorded, not undone by the rollback.
+		update_post_meta( $retry_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $retry_id, StoryStatus::Deleted, 'Precondition: disabling must delete the story.' );
+		// A title change while disabled makes the update after the restore necessary.
+		$this->update_post( $retry_id, array( 'post_title' => 'E2E herstel opnieuw geprobeerd en weer verwijderd' ) );
+		$delete_after_patch = function ( $response, array $args, string $url ) use ( $retry_story_id ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories/' . $retry_story_id ) ) {
+				$this->babbel_request( 'DELETE', '/stories/' . $retry_story_id );
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $delete_after_patch, 1, 3 );
+		try {
+			// Only a restore in two requests has an update after it.
+			$this->with_two_step_restore( fn () => update_post_meta( $retry_id, self::SEND_TO_BABBEL_META_KEY, 1 ) );
+		} finally {
+			remove_filter( 'http_response', $delete_after_patch, 1 );
+		}
+		$this->assert_story_status( $retry_id, StoryStatus::DeletedInBabbel, 'A deletion found right after a restore must be recorded.' );
+		$this->assert_same( 0, $this->count_babbel_requests( fn () => $this->update_post( $retry_id, array() ) ), 'Nothing may restore it on its own.' );
+
+		// A story without a snapshot that was deleted in Babbel is recognized by a lookup that includes deleted stories.
+		list( $legacy_id, $legacy_story_id ) = $this->create_sent_story(
+			'E2E verwijderd zonder momentopname',
+			'Een verhaal van een eerdere versie is buiten WordPress verwijderd.'
+		);
+		$legacy_state                        = KnabbelWP\get_story_state( $legacy_id );
+		unset( $legacy_state['synced'], $legacy_state['window_base'], $legacy_state['post_date_seen'] );
+		update_post_meta( $legacy_id, '_zw_knabbel_story_state', $legacy_state );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $legacy_story_id );
+		$this->update_post( $legacy_id, array( 'post_title' => 'E2E verwijderd zonder momentopname bewerkt' ) );
+		$this->assert_story_status( $legacy_id, StoryStatus::DeletedInBabbel, 'A deleted story without a snapshot must be recognized as deleted.' );
+
+		// A story deleted outside WordPress after an unanswered update is recognized as deleted, not restored.
+		list( $lost_id, $lost_story_id ) = $this->create_sent_story(
+			'E2E onbeantwoord en verwijderd',
+			'Een bijwerking blijft onbeantwoord en daarna verwijdert iemand het verhaal in Babbel.'
+		);
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		$this->update_post( $lost_id, array( 'post_title' => 'E2E onbeantwoord en verwijderd bewerkt' ) );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $lost_story_id );
+		$this->update_post( $lost_id, array() );
+		$this->assert_story_status( $lost_id, StoryStatus::DeletedInBabbel, 'A deletion found while verifying an update must not be restored.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $lost_story_id );
+
+		// The same check keeps going when the post no longer wants a story, and ends deleted without a warning.
+		list( $off_id, $off_story_id ) = $this->create_sent_story(
+			'E2E onbeantwoord, verwijderd en uitgeschakeld',
+			'Na een onbeantwoorde bijwerking verwijdert iemand het verhaal en de redactie zet radionieuws uit.'
+		);
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		$this->update_post( $off_id, array( 'post_title' => 'E2E onbeantwoord, verwijderd en uitgeschakeld bewerkt' ) );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $off_story_id );
+		update_post_meta( $off_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $off_id, StoryStatus::Deleted, 'Disabling must end in the deleted state.' );
+		$this->assert_synced( $off_id, 'Disabling must clear the warning.' );
+
+		// When Babbel cannot be read, nothing is decided and nothing is restored.
+		list( $dark_id, $dark_story_id ) = $this->create_sent_story(
+			'E2E onbeantwoord, verwijderd en onleesbaar',
+			'Na een onbeantwoorde bijwerking verwijdert iemand het verhaal en is Babbel even niet leesbaar.'
+		);
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		$this->update_post( $dark_id, array( 'post_title' => 'E2E onbeantwoord, verwijderd en onleesbaar bewerkt' ) );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $dark_story_id );
+		$this->set_failing_babbel_methods( array( 'GET', 'PATCH' ) );
+		$this->update_post( $dark_id, array() );
+		$this->set_failing_babbel_methods( array() );
+		$state = KnabbelWP\get_story_state( $dark_id );
+		$this->assert_same(
+			array( StoryStatus::Sent->value, 'update', 1 ),
+			array( $state['status'] ?? null, $state['remote_unverified'] ?? null, $this->sync_retry_count( $dark_id ) ),
+			'An unreadable Babbel must leave the story unverified and retry.'
+		);
+		$this->run_pending_sync_retry( $dark_id );
+		$this->assert_story_status( $dark_id, StoryStatus::DeletedInBabbel, 'Once readable, the deletion must be recorded, not undone.' );
+		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $dark_story_id );
+
+		// A 404 story.not_found is recorded as missing; nothing recreates it on its own.
+		$missing_title                         = 'E2E ontbreekt in Babbel';
+		list( $missing_id, $missing_story_id ) = $this->create_sent_story(
+			$missing_title,
+			'Het verhaal bestaat niet meer in Babbel en mag niet vanzelf opnieuw worden gemaakt.'
+		);
+		KnabbelWP\update_story_state( $missing_id, array( 'story_id' => '999999999' ) );
+		$this->update_post( $missing_id, array( 'post_title' => $missing_title . ' bewerkt' ) );
+		$state = KnabbelWP\get_story_state( $missing_id );
+		$this->assert_same( StoryStatus::MissingInBabbel->value, $state['status'] ?? null, 'A 404 must mark the story missing.' );
+		$this->assert_same( 0, $this->sync_retry_count( $missing_id ), 'A 404 must not be retried.' );
+		$requests = $this->count_babbel_requests(
+			function () use ( $missing_id, $missing_title ) {
+				$this->update_post( $missing_id, array( 'post_title' => $missing_title . ' nogmaals' ) );
+				KnabbelWP\retry_story_sync( $missing_id );
+			}
+		);
+		$this->assert_same( 0, $requests, 'A missing story must not be written to on its own.' );
+		$this->assert_same( 0, $this->story_action_count( $missing_id ), 'A missing story must not be created again on its own.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $missing_title ), 'The original story must stay alone.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $missing_title . ' nogmaals' ), 'No new story may appear.' );
+		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $missing_story_id );
+
+		// Unpublishing and publishing again keeps the state, so no new story is created on its own.
+		$this->update_post( $missing_id, array( 'post_status' => 'draft' ) );
+		$this->update_post( $missing_id, array( 'post_status' => 'publish' ) );
+		$this->assert_story_status( $missing_id, StoryStatus::MissingInBabbel, 'Unpublishing must keep a missing story.' );
+		$this->assert_same( 0, $this->story_action_count( $missing_id ), 'Publishing again must not queue a new story.' );
+
+		// Disabling clears the state, so enabling again is the editor's explicit way to create a new story.
+		update_post_meta( $missing_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_same( array(), KnabbelWP\get_story_state( $missing_id ), 'Disabling must clear a missing story.' );
+		$this->assert_same( 0, $this->story_action_count( $missing_id ), 'Disabling must not queue a new story.' );
+
+		// A restore that finds no story records it as missing.
+		list( $patch_id ) = $this->create_sent_story(
+			'E2E herstel zonder verhaal',
+			'Een verhaal dat niet meer bestaat kan niet worden hersteld.'
+		);
+		update_post_meta( $patch_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		KnabbelWP\update_story_state( $patch_id, array( 'story_id' => '999999997' ) );
+		update_post_meta( $patch_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->assert_story_status( $patch_id, StoryStatus::MissingInBabbel, 'A PATCH 404 must mark the story missing.' );
+
+		// Restores that run into a deletion outside WordPress record it instead of restoring again.
+		$this->with_two_step_restore( fn () => $this->check_restores_running_into_external_deletes() );
+
+		// In two requests, an explicit restore waits while the old window could reach a bulletin the
+		// new one would not; in one request, it runs at once.
+		$this->with_two_step_restore( fn () => $this->check_restore_waits_for_old_window() );
+		if ( $this->babbel_restores_atomically() ) {
+			$this->check_restore_in_one_request();
+		}
+
+		// A DELETE that finds no story counts as deleted.
+		list( $gone_id ) = $this->create_sent_story(
+			'E2E verwijderen zonder verhaal',
+			'Een verhaal dat niet meer bestaat kan niet nog eens worden verwijderd.'
+		);
+		KnabbelWP\update_story_state( $gone_id, array( 'story_id' => '999999998' ) );
+		update_post_meta( $gone_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $gone_id, StoryStatus::Deleted, 'A DELETE 404 must end in the deleted state.' );
+		$this->assert_synced( $gone_id, 'A DELETE 404 must not leave a warning.' );
+	}
+
+	/**
+	 * Verifies that an explicit restore never exposes the old window.
+	 *
+	 * A story deleted outside WordPress was never parked. While its old window
+	 * selects it around today and the post's window does not, restoring it could
+	 * put it in a bulletin before the update gives it the new window; the restore
+	 * then waits, and runs once the post's window covers those days too.
+	 */
+	private function check_restore_waits_for_old_window(): void {
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E herstel wacht op venster',
+			'Het oude venster van dit verhaal loopt nog terwijl het artikel een embargo krijgt.'
+		);
+		$this->set_remote_story_status( $story_id, 'active' );
+		// The window starts a day after publication, so a bulletin made tomorrow would select it.
+		$tomorrow = ( new DateTimeImmutable( 'tomorrow', wp_timezone() ) )->format( 'Y-m-d' );
+		$this->assert_same( true, $this->selectable_on( $story_id, $tomorrow ), 'Precondition: the active story must be selectable tomorrow.' );
+
+		// Someone deletes the story in Babbel; the post then gets an embargo date.
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->schedule_post( $post_id, $this->future_post_date( 10 ) );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+
+		$restores = 0;
+		$count    = static function ( $response, array $args, string $url ) use ( $story_id, &$restores ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories/' . $story_id ) ) {
+				++$restores;
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $count, 10, 3 );
+		try {
+			KnabbelWP\restore_story_deleted_in_babbel( $post_id );
+			$this->assert_same( 0, $restores, 'A restore that could expose the old window must wait.' );
+			$state = KnabbelWP\get_story_state( $post_id );
+			$this->assert_same(
+				array( StoryStatus::DeletedInBabbel->value, true, 'restore' ),
+				array( $state['status'] ?? null, $state['restore_requested'] ?? null, $state['last_sync_error']['operation'] ?? null ),
+				'A waiting restore must keep the request and show why it waits.'
+			);
+			$next = as_next_scheduled_action( KnabbelWP\STORY_SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' );
+			$this->assert_same(
+				true,
+				is_int( $next ) && $next >= ( new DateTimeImmutable( 'tomorrow', wp_timezone() ) )->getTimestamp(),
+				'A waiting restore must check again after midnight.'
+			);
+			$this->assert_same( false, $this->selectable_on( $story_id, $tomorrow ), 'The story must stay out of bulletins meanwhile.' );
+
+			// Publishing the post now gives it the same window again, so the same story comes back.
+			$this->update_post(
+				$post_id,
+				array(
+					'post_date'     => current_time( 'mysql' ),
+					'post_date_gmt' => current_time( 'mysql', true ),
+					'edit_date'     => true,
+				)
+			);
+		} finally {
+			remove_filter( 'http_response', $count, 10 );
+		}
+		$this->assert_same( 1, $restores, 'Once safe, the waiting restore must run.' );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The same story must be restored.' );
+		$this->assert_same( $story_id, (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' ), 'The restore must keep the story ID.' );
+
+		// An old window that only starts in a few days counts too: an unanswered update after the
+		// restore could leave the story with it until then.
+		$post_id = $this->create_enabled_draft(
+			'E2E herstel wacht op later venster',
+			'Het oude venster begint pas over een paar dagen, het embargo nog later.'
+		);
+		$this->schedule_post( $post_id, $this->future_post_date( 2 ) );
+		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		$story_id = (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' );
+		$this->set_remote_story_status( $story_id, 'active' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->schedule_post( $post_id, $this->future_post_date( 10 ) );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+		$bare      = 0;
+		$bare_seen = static function ( $preempt, array $args, string $url ) use ( $story_id, &$bare ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories/' . $story_id )
+				&& array( 'deleted_at' => '' ) === json_decode( (string) ( $args['body'] ?? '' ), true ) ) {
+				++$bare;
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $bare_seen, 0, 3 );
+		try {
+			KnabbelWP\restore_story_deleted_in_babbel( $post_id );
+		} finally {
+			remove_filter( 'pre_http_request', $bare_seen, 0 );
+		}
+		$this->assert_same( 0, $bare, 'A restore must wait while any later day of the old window could select the story.' );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'The story must stay deleted meanwhile.' );
+	}
+
+	/**
+	 * Verifies that an explicit restore in one request runs at once and safely.
+	 *
+	 * The same unparked, active story as in check_restore_waits_for_old_window()
+	 * comes back with its new window in one request, keeping its ID, and is not
+	 * selectable on its old window even when Babbel answers the restore.
+	 */
+	private function check_restore_in_one_request(): void {
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E herstel in een verzoek',
+			'Het oude venster loopt nog, maar het herstel brengt meteen het nieuwe venster mee.'
+		);
+		$this->set_remote_story_status( $story_id, 'active' );
+		$tomorrow = ( new DateTimeImmutable( 'tomorrow', wp_timezone() ) )->format( 'Y-m-d' );
+		$this->assert_same( true, $this->selectable_on( $story_id, $tomorrow ), 'Precondition: the active story must be selectable tomorrow.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$embargo = $this->future_post_date( 10 );
+		$this->schedule_post( $post_id, $embargo );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+
+		$at_restore = array();
+		$probe      = function ( $response, array $args, string $url ) use ( $story_id, $tomorrow, &$at_restore ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories/' . $story_id ) ) {
+				$at_restore[] = $this->selectable_on( $story_id, $tomorrow );
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $probe, 10, 3 );
+		try {
+			KnabbelWP\restore_story_deleted_in_babbel( $post_id );
+		} finally {
+			remove_filter( 'http_response', $probe, 10 );
+		}
+		$this->assert_same( array( false ), $at_restore, 'A restore in one request must never expose the old window.' );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The restore must run at once.' );
+		$this->assert_synced( $post_id, 'The restore must clear the request and the warning.' );
+		$this->assert_same( $story_id, (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' ), 'The restore must keep the story ID.' );
+		$this->assert_same(
+			true,
+			$this->selectable_on( $story_id, KnabbelWP\calculate_story_dates( $embargo )['start_date'] ),
+			'The story must be selectable in its new window.'
+		);
+	}
+
+	/**
+	 * Verifies restores that meet a story deleted outside WordPress halfway.
+	 */
+	private function check_restores_running_into_external_deletes(): void {
+		$forbid = static function ( array $methods ) {
+			return static function ( $preempt, array $args ) use ( $methods ) {
+				if ( in_array( $args['method'] ?? '', $methods, true ) ) {
+					return array(
+						'headers'  => array( 'content-type' => 'application/problem+json' ),
+						'body'     => wp_json_encode(
+							array(
+								'detail' => 'E2E: not allowed right now',
+								'code'   => 'auth.forbidden',
+							)
+						),
+						'response' => array(
+							'code'    => 403,
+							'message' => 'Forbidden',
+						),
+						'cookies'  => array(),
+					);
+				}
+				return $preempt;
+			};
+		};
+
+		// The restore's update and the rollback's park both go unanswered; then someone deletes the story.
+		list( $post_id, $story_id ) = $this->create_sent_story( 'E2E herstel onbeantwoord verwijderd', 'Herstel en terugdraaien blijven onbeantwoord.' );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->update_post( $post_id, array( 'post_title' => 'E2E herstel onbeantwoord verwijderd bewerkt' ) );
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_same(
+			'update',
+			KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null,
+			'An unanswered park must be recorded as an update.'
+		);
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A deletion found after an unanswered park must not be restored.' );
+
+		// Someone deletes the story right after the restore's update; the rollback's park finds it gone.
+		list( $post_id, $story_id ) = $this->create_sent_story( 'E2E herstel tussendoor verwijderd', 'Tijdens het terugdraaien is het verhaal al verwijderd.' );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->update_post( $post_id, array( 'post_title' => 'E2E herstel tussendoor verwijderd bewerkt' ) );
+		$delete_after_put = function ( $response, array $args, string $url ) use ( $story_id ) {
+			static $done = false;
+			if ( ! $done && 'PUT' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories/' . $story_id ) ) {
+				$done = true;
+				$this->babbel_request( 'DELETE', '/stories/' . $story_id );
+				return new WP_Error( 'http_request_failed', 'E2E: the answer from Babbel was lost' );
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $delete_after_put, 1, 3 );
+		try {
+			update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		} finally {
+			remove_filter( 'http_response', $delete_after_put, 1 );
+		}
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A rollback whose park finds the story deleted must record that.' );
+		$this->assert_same( 0, $this->count_babbel_requests( fn () => KnabbelWP\retry_story_sync( $post_id ) ), 'Nothing may restore it on its own.' );
+
+		// A partial restore that still owes a status meets a deletion: the status read classifies it.
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E status verschuldigd verwijderd',
+			'Het verhaal wordt verwijderd terwijl de status nog openstaat.'
+		);
+		$this->set_remote_story_status( $story_id, 'expired' );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->update_post( $post_id, array( 'post_title' => 'E2E status verschuldigd verwijderd bewerkt' ) );
+		$reject = $forbid( array( 'PUT', 'DELETE' ) );
+		add_filter( 'pre_http_request', $reject, 1, 2 );
+		try {
+			update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		} finally {
+			remove_filter( 'pre_http_request', $reject, 1 );
+		}
+		$this->assert_same( true, KnabbelWP\get_story_state( $post_id )['expired_reset'] ?? null, 'Precondition: the default status must be owed.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A status read that finds the story deleted must record that.' );
+
+		// A confirmed restore without readable fields whose rollback park is rejected, then deleted
+		// outside WordPress, is recorded as deleted in Babbel, not restored again.
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E herstel zonder velden verwijderd',
+			'Het herstel geeft geen velden terug en daarna wordt het verhaal verwijderd.'
+		);
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$empty_patch = static function ( $response, array $args ) {
+			if ( 'PATCH' === ( $args['method'] ?? '' ) && is_array( $response ) ) {
+				$response['body'] = '{}';
+			}
+			return $response;
+		};
+		$reject      = $forbid( array( 'PUT' ) );
+		// The lookup before the restore still works; reading the restored story does not.
+		$fail_read = static function ( $preempt, array $args, string $url ) use ( $story_id ) {
+			if ( 'GET' === ( $args['method'] ?? 'GET' ) && str_ends_with( $url, '/stories/' . $story_id ) ) {
+				return new WP_Error( 'http_request_failed', 'E2E: Babbel is unreachable' );
+			}
+			return $preempt;
+		};
+		add_filter( 'http_response', $empty_patch, 20, 2 );
+		add_filter( 'pre_http_request', $reject, 1, 2 );
+		add_filter( 'pre_http_request', $fail_read, 1, 3 );
+		try {
+			update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		} finally {
+			remove_filter( 'pre_http_request', $fail_read, 1 );
+			remove_filter( 'pre_http_request', $reject, 1 );
+			remove_filter( 'http_response', $empty_patch, 20 );
+		}
+		$this->assert_same( 'update', KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'A confirmed restore must be verified as applied.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A deletion after a confirmed restore must not be restored on its own.' );
+
+		// A lookup that shows the story live but without its fields decides nothing.
+		list( $post_id, $story_id ) = $this->create_sent_story( 'E2E onvolledige opzoeking', 'De opzoeking geeft het verhaal zonder velden terug.' );
+		$this->set_lost_babbel_responses( array( 'PUT' ) );
+		$this->update_post( $post_id, array( 'post_title' => 'E2E onvolledige opzoeking bewerkt' ) );
+		$this->set_lost_babbel_responses( array() );
+		$strip_list = static function ( $response, array $args, string $url ) use ( $story_id ) {
+			if ( is_array( $response ) && str_contains( $url, 'trashed=with' ) ) {
+				$response['body'] = (string) wp_json_encode(
+					array(
+						'data' => array(
+							array(
+								'id'         => (int) $story_id,
+								'deleted_at' => null,
+							),
+						),
+					)
+				);
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $strip_list, 20, 3 );
+		try {
+			$this->update_post( $post_id, array() );
+		} finally {
+			remove_filter( 'http_response', $strip_list, 20 );
+		}
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( StoryStatus::Sent->value, 'update', 1 ),
+			array( $state['status'] ?? null, $state['remote_unverified'] ?? null, $this->sync_retry_count( $post_id ) ),
+			'An incomplete live lookup must keep the story unverified and retry.'
+		);
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_synced( $post_id, 'A complete lookup must then settle the story.' );
+
+		// A lost restore answer, a lookup that confirms the story live without its fields, and then a
+		// deletion outside WordPress: the story is recorded as deleted in Babbel, not restored again.
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E herstel bevestigd zonder velden',
+			'Het herstel blijft onbeantwoord en de opzoeking geeft het verhaal zonder velden terug.'
+		);
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->set_lost_babbel_responses( array( 'PATCH' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->set_lost_babbel_responses( array() );
+		$this->assert_same( 'restore', KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'Precondition: the restore went unanswered.' );
+		$strip_this_list = static function ( $response, array $args, string $url ) use ( $story_id ) {
+			if ( is_array( $response ) && str_contains( $url, 'trashed=with' ) ) {
+				$response['body'] = (string) wp_json_encode(
+					array(
+						'data' => array(
+							array(
+								'id'         => (int) $story_id,
+								'deleted_at' => null,
+							),
+						),
+					)
+				);
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $strip_this_list, 20, 3 );
+		try {
+			$this->run_pending_sync_retry( $post_id );
+		} finally {
+			remove_filter( 'http_response', $strip_this_list, 20 );
+		}
+		$this->assert_same( 'update', KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'A story confirmed live must count as restored.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A deletion after a confirmed restore must not be restored on its own.' );
 	}
 
 	/**
@@ -992,7 +1598,7 @@ final class Knabbel_E2E_Suite {
 		$this->set_babbel_writes_failing( false );
 		$state = KnabbelWP\get_story_state( $post_id );
 		$this->assert_sync_failure_preserved( $post_id, $story_id, StoryStatus::Sent, 'update' );
-		$this->assert_same( true, $state['remote_unverified'] ?? null, 'A write that may have reached Babbel must be marked unverified.' );
+		$this->assert_same( 'update', $state['remote_unverified'] ?? null, 'A write that may have reached Babbel must be marked unverified.' );
 		$this->assert_same( 1, $this->sync_retry_count( $post_id ), 'A failed update must schedule exactly one retry.' );
 		$this->assert_same( 1, $state['sync_retry_attempts'] ?? null, 'The first retry must be counted.' );
 		$next_retry = as_next_scheduled_action( self::SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), self::ACTION_GROUP );
@@ -1193,7 +1799,7 @@ final class Knabbel_E2E_Suite {
 		$this->set_lost_babbel_responses( array( 'PUT' ) );
 		$this->update_post( $post_id, array( 'post_title' => $title . ' onbeantwoord' ) );
 		$this->set_lost_babbel_responses( array() );
-		$this->assert_same( true, KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'An unanswered update must be marked unverified.' );
+		$this->assert_same( 'update', KnabbelWP\get_story_state( $post_id )['remote_unverified'] ?? null, 'An unanswered update must be marked unverified.' );
 		$this->update_post( $post_id, array( 'post_title' => $current_title ) );
 		$this->assert_same( $current_title, $this->get_babbel_story( $story_id )['title'] ?? null, 'Reverting must reach Babbel after an unanswered update.' );
 		$this->assert_synced( $post_id, 'A verified story in line with the post must clear the failure.' );
@@ -1498,20 +2104,23 @@ final class Knabbel_E2E_Suite {
 			if ( str_starts_with( $route, 'trash' ) ) {
 				wp_trash_post( $post_id );
 				wp_untrash_post( $post_id );
+			} elseif ( str_starts_with( $route, 'legacy' ) ) {
+				// An earlier plugin version deleted the story without parking it and kept no snapshot.
+				$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
+				$legacy           = get_post_meta( $post_id, '_zw_knabbel_story_state', true );
+				$legacy['status'] = StoryStatus::Deleted->value;
+				unset( $legacy['synced'], $legacy['window_base'] );
+				update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy );
+				$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
 			} else {
-				if ( ! str_starts_with( $route, 'unschedule' ) ) {
-					// Deleted without parking: directly in Babbel, or by an earlier plugin version.
+				if ( str_starts_with( $route, 'external' ) ) {
+					// Deleted directly in Babbel, without parking.
 					$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $story_id );
 				}
 				$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
 			}
+			// Unpublishing a story already deleted in Babbel ends in the deleted state, as #93 specifies.
 			$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Precondition: the story must be deleted.' );
-			if ( str_starts_with( $route, 'legacy' ) ) {
-				// Earlier versions kept no snapshot of what Babbel confirmed.
-				$legacy = get_post_meta( $post_id, '_zw_knabbel_story_state', true );
-				unset( $legacy['synced'] );
-				update_post_meta( $post_id, '_zw_knabbel_story_state', $legacy );
-			}
 
 			$at_restore = array();
 			$probe      = function ( $response, array $args, string $url ) use ( $story_id, $old_day, &$at_restore ) {
@@ -1703,10 +2312,8 @@ final class Knabbel_E2E_Suite {
 			remove_filter( 'http_response', $count, 10 );
 		}
 		$this->assert_same( 0, $restores, 'A story without evidence of parking must never be restored.' );
-		$this->assert_story_status( $post_id, StoryStatus::Scheduled, 'The post must get a new story instead.' );
-		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
-		$new_id = (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' );
-		$this->assert_same( true, '' !== $new_id && $new_id !== $story_id, 'The post must get a new story.' );
+		// The unanswered update makes the deletion one outside WordPress (#93): it is not replaced either.
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'The deletion must be recorded as one in Babbel.' );
 		$this->assert_same( false, $this->selectable_on( $story_id, $old_day ), 'The old story must stay out of bulletins.' );
 
 		// A confirmed park proves nothing later: an editor gives the story its weekdays back in Babbel
@@ -2034,7 +2641,7 @@ final class Knabbel_E2E_Suite {
 			$state['message'] ?? null,
 			'A partial restore must not read as a success.'
 		);
-		$this->assert_same( true, $state['remote_unverified'] ?? null, 'An unanswered write must be verified, so the retry reads Babbel first.' );
+		$this->assert_same( 'update', $state['remote_unverified'] ?? null, 'An unanswered park, with no delete after it, must be verified first.' );
 		$stale = KnabbelWP\calculate_story_dates( $this->future_post_date( 40 ) );
 		$this->assert_same(
 			$stale['start_date'],

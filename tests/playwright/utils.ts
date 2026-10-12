@@ -189,6 +189,17 @@ export async function getBabbelStory(storyID: string): Promise<BabbelStory> {
 }
 
 /**
+ * Delete a story directly in Babbel, as an editor outside WordPress would.
+ */
+export async function deleteBabbelStory(storyID: string): Promise<void> {
+    const response = await babbelRequest(
+        `/stories/${encodeURIComponent(storyID)}`,
+        { method: 'DELETE' },
+    );
+    expect(response.status(), await response.text()).toBe(204);
+}
+
+/**
  * Read only the status code, for assertions about a story's absence.
  */
 export async function babbelStoryStatus(storyID: string): Promise<number> {
