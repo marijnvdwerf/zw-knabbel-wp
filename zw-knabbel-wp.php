@@ -624,6 +624,7 @@ function ajax_test_api(): void {
  * @since 0.1.0
  * @since 0.7.0 Excludes the current post from the AI few-shot examples.
  * @since 0.8.0 Accepts only a post ID and leaves already sent stories untouched.
+ * @since 0.9.0 Skips posts that are no longer published, scheduled or enabled, also after generation.
  * @param int $post_id The WordPress post ID.
  */
 function process_story_async( int $post_id ): void {
@@ -666,6 +667,13 @@ function process_story_async( int $post_id ): void {
 		return;
 	}
 
+	// Only published and scheduled posts get a story; the post may have left publication since queueing.
+	if ( ! in_array( $post->post_status, array( 'publish', 'future' ), true ) ) {
+		log( 'info', 'CronProcessor', 'Post is no longer published or scheduled — skipping', array( 'post_id' => $post_id ) );
+		delete_post_meta( $post_id, '_zw_knabbel_story_state' );
+		return;
+	}
+
 	// Update status to processing.
 	update_story_state(
 		$post_id,
@@ -676,9 +684,6 @@ function process_story_async( int $post_id ): void {
 	);
 
 	$content = wp_strip_all_tags( $post->post_content );
-
-	// Use the raw post title directly (not get_the_title() which applies filters and prefixes).
-	$title = $post->post_title;
 
 	// Generate speech text.
 	$speech_text = ai_generate_content( $content, $post_id );
@@ -693,6 +698,22 @@ function process_story_async( int $post_id ): void {
 		return;
 	}
 
+	// Generation takes a while: re-read the post so a change in the meantime is respected.
+	clean_post_cache( $post_id );
+	$post = get_post( $post_id );
+	if (
+		! $post
+		|| ! get_post_meta( $post_id, '_zw_knabbel_send_to_babbel', true )
+		|| ! in_array( $post->post_status, array( 'publish', 'future' ), true )
+	) {
+		log( 'info', 'CronProcessor', 'Post left publication or Radio News during processing — skipping', array( 'post_id' => $post_id ) );
+		delete_post_meta( $post_id, '_zw_knabbel_story_state' );
+		return;
+	}
+
+	// Use the raw post title directly (not get_the_title() which applies filters and prefixes).
+	$title = $post->post_title;
+
 	// Prepare story data using configurable defaults.
 	$options        = get_plugin_settings();
 	$default_status = $options['default_status'];
@@ -700,9 +721,8 @@ function process_story_async( int $post_id ): void {
 	// Calculate dates based on post status:
 	// - For scheduled posts (future): use the scheduled publish time (post_date).
 	// - For published posts: use current time.
-	$post_status = get_post_status( $post_id );
-	$base_date   = 'future' === $post_status ? $post->post_date : 'now';
-	$dates       = calculate_story_dates( $base_date );
+	$base_date = 'future' === $post->post_status ? $post->post_date : 'now';
+	$dates     = calculate_story_dates( $base_date );
 
 	$story_data = array(
 		'title'      => $title,

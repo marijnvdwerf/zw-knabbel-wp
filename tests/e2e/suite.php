@@ -87,7 +87,8 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-017', 'delete and restore failures remain retryable', $this->test_delete_and_restore_failures( ... ) );
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
 		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
-		$this->run_case( 'E2E-020', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-020', 'rescheduling moves the window and unpublishing deletes the story', $this->test_published_status_transitions( ... ) );
+		$this->run_case( 'E2E-021', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -843,6 +844,122 @@ final class Knabbel_E2E_Suite {
 			StoryStatus::Sent,
 			'update',
 			'API error: HTTP 410 - Story with id ' . $story_id . ' has been deleted'
+		);
+	}
+
+	/**
+	 * Verifies transitions out of the publish status.
+	 */
+	private function test_published_status_transitions(): void {
+		list( $post_id, $story_id ) = $this->create_sent_story(
+			'E2E gepubliceerd en opnieuw ingepland',
+			'Een per ongeluk gepubliceerd artikel krijgt alsnog een embargo tot een latere datum.'
+		);
+		$embargo_date               = $this->future_post_date( 10 );
+		$this->schedule_post( $post_id, $embargo_date );
+		$this->assert_same( 'future', get_post_status( $post_id ), 'Precondition: a future date must reschedule the published post.' );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same( StoryStatus::Sent->value, $state['status'] ?? null, 'Rescheduling must keep the story sent.' );
+		$this->assert_same( true, ! isset( $state['last_sync_error'] ), 'Rescheduling must synchronize without errors.' );
+		$this->assert_story_window( $story_id, $embargo_date, 'Rescheduling a published post must move the window to the new date.' );
+
+		// A time-only change on the same day leaves the window as it is.
+		$later_same_day = substr( $embargo_date, 0, 10 ) . ' 15:30:00';
+		$requests       = $this->count_babbel_requests(
+			fn () => $this->update_post(
+				$post_id,
+				array(
+					'post_date'     => $later_same_day,
+					'post_date_gmt' => get_gmt_from_date( $later_same_day ),
+				)
+			)
+		);
+		$this->assert_same( 0, $requests, 'A time-only change must not send a Babbel request.' );
+		$this->assert_story_window( $story_id, $embargo_date, 'A time-only change must keep the rescheduled window.' );
+
+		foreach ( array( 'draft', 'pending', 'private' ) as $status ) {
+			list( $post_id, $story_id ) = $this->create_sent_story(
+				'E2E gepubliceerd naar ' . $status,
+				'Een gepubliceerd artikel gaat offline en mag niet meer in bulletins terechtkomen.'
+			);
+			$this->update_post( $post_id, array( 'post_status' => $status ) );
+			$this->assert_story_status( $post_id, StoryStatus::Deleted, 'publish -> ' . $status . ' must delete the story.' );
+			$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+		}
+
+		$title   = 'E2E gepubliceerd naar concept met wachtrij';
+		$post_id = $this->create_enabled_draft( $title, 'Een gepubliceerd artikel gaat terug naar concept voordat de story is gemaakt.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$this->assert_same( 1, $this->story_action_count( $post_id ), 'Precondition: one story action must be pending.' );
+		$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Unpublishing must cancel pending processing.' );
+		$this->run_action_scheduler( self::STORY_HOOK, 0, array( 'post_id' => $post_id ) );
+		$this->assert_same( array(), KnabbelWP\get_story_state( $post_id ), 'Unpublishing before processing must clear local story state.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Unpublishing before processing must not create a story.' );
+
+		// A worker that already started must not create a story for a post that is no longer published.
+		KnabbelWP\process_story_async( $post_id );
+		$this->assert_same( array(), KnabbelWP\get_story_state( $post_id ), 'Processing a draft must leave no story state.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Processing a draft must not create a story.' );
+
+		$title   = 'E2E gedepubliceerd tijdens verwerking';
+		$post_id = $this->create_enabled_draft( $title, 'Een artikel gaat terug naar concept terwijl de radiotekst wordt gegenereerd.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$unpublish = function ( $preempt, array $args, string $url ) use ( $post_id ) {
+			if ( 'https://api.openai.com/v1/responses' === $url && 'publish' === get_post_status( $post_id ) ) {
+				$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $unpublish, 5, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $unpublish, 5 );
+		}
+		$this->assert_same( 'draft', get_post_status( $post_id ), 'Precondition: the post must be unpublished during generation.' );
+		$this->assert_same( array(), KnabbelWP\get_story_state( $post_id ), 'Unpublishing during generation must leave no story state.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Unpublishing during generation must not create a story.' );
+	}
+
+	/**
+	 * Counts Babbel API requests made by a callback.
+	 *
+	 * @param callable $callback Code to observe.
+	 * @return int Number of requests to the Babbel API.
+	 */
+	private function count_babbel_requests( callable $callback ): int {
+		$count   = 0;
+		$counter = static function ( $preempt, array $args, string $url ) use ( &$count ) {
+			if ( str_starts_with( $url, self::BABBEL_BASE_URL ) ) {
+				++$count;
+			}
+			return $preempt;
+		};
+		add_filter( 'pre_http_request', $counter, 1, 3 );
+		try {
+			$callback();
+		} finally {
+			remove_filter( 'pre_http_request', $counter, 1 );
+		}
+
+		return $count;
+	}
+
+	/**
+	 * Asserts that a story window follows a base date.
+	 *
+	 * @param string $story_id  Babbel story ID.
+	 * @param string $base_date Local MySQL datetime the window derives from.
+	 * @param string $message   Failure message.
+	 */
+	private function assert_story_window( string $story_id, string $base_date, string $message ): void {
+		$story = $this->get_babbel_story( $story_id );
+		$dates = KnabbelWP\calculate_story_dates( $base_date );
+		$this->assert_same(
+			array( $dates['start_date'], $dates['end_date'] ),
+			array( $this->date_only( $story['start_date'] ?? '' ), $this->date_only( $story['end_date'] ?? '' ) ),
+			$message
 		);
 	}
 

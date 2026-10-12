@@ -77,6 +77,7 @@ function handle_post_saved( int $post_id, \WP_Post $post, bool $update, ?\WP_Pos
  * trigger reconciliation after WordPress has persisted the relevant change.
  *
  * @since 0.5.0
+ * @since 0.9.0 Removes the story when a post leaves publish, and moves its window when a published post is rescheduled.
  *
  * @param int           $post_id     Post ID.
  * @param \WP_Post|null $post_before Post state before a save, when available.
@@ -94,15 +95,17 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
 	$story_id       = (string) ( $state['story_id'] ?? '' );
 	$active_status  = in_array( $post->post_status, array( 'publish', 'future' ), true );
 	$is_untrash     = null !== $post_before && 'trash' === $post_before->post_status && 'trash' !== $post->post_status;
-	$is_unscheduled = null !== $post_before
-		&& 'future' === $post_before->post_status
+	$is_rescheduled = null !== $post_before && 'publish' === $post_before->post_status && 'future' === $post->post_status;
+	// Left publish/future for draft, pending or private; trash is handled separately.
+	$is_deactivated = null !== $post_before
+		&& in_array( $post_before->post_status, array( 'publish', 'future' ), true )
 		&& ! $active_status;
 	// Status changed into publish/future, except the publish→future demotion.
 	$is_activated  = null !== $post_before
 		&& $active_status
 		&& $post_before->post_status !== $post->post_status
-		&& ! ( 'publish' === $post_before->post_status && 'future' === $post->post_status );
-	$should_remove = ! $send_to_babbel || 'trash' === $post->post_status || $is_unscheduled;
+		&& ! $is_rescheduled;
+	$should_remove = ! $send_to_babbel || 'trash' === $post->post_status || $is_deactivated;
 
 	if ( $should_remove ) {
 		if ( $story_id && in_array( $status, array( StoryStatus::Sent->value, StoryStatus::Error->value ), true ) ) {
@@ -112,9 +115,12 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
 			} elseif ( 'trash' === $post->post_status ) {
 				$message = __( 'Story deleted (post trashed)', 'zw-knabbel-wp' );
 				$context = 'post_trashed';
-			} else {
+			} elseif ( 'future' === $post_before?->post_status ) {
 				$message = __( 'Story deleted (post unscheduled)', 'zw-knabbel-wp' );
 				$context = 'post_unscheduled';
+			} else {
+				$message = __( 'Story deleted (post unpublished)', 'zw-knabbel-wp' );
+				$context = 'post_unpublished';
 			}
 
 			push_story_delete( $post_id, $story_id, $message, $context );
@@ -148,6 +154,18 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
 	}
 
 	if ( ! $story_id || StoryStatus::Sent->value !== $status || null === $post_before ) {
+		return;
+	}
+
+	// An embargo set after publication moves the window to the new publication date.
+	if ( $is_rescheduled ) {
+		push_story_update(
+			$post_id,
+			$story_id,
+			build_full_story_update( $post->post_title, $post->post_date ),
+			__( 'Story updated (post rescheduled)', 'zw-knabbel-wp' ),
+			'publish_to_future'
+		);
 		return;
 	}
 
