@@ -876,6 +876,9 @@ final class Knabbel_E2E_Suite {
 		$paragraphs = "Eerste alinea van het bericht.\n\nTweede alinea van het bericht.";
 		$valid      = 'Een geldige radiotekst van één alinea.';
 		$settings   = get_option( 'knabbel_settings', array() );
+		$snapshot   = $this->snapshot_options(
+			array( 'knabbel_settings', 'knabbel_recent_errors', 'knabbel_e2e_ai_outputs', 'knabbel_e2e_ai_call_count', 'knabbel_e2e_ai_last_request' )
+		);
 
 		try {
 			delete_option( 'knabbel_recent_errors' );
@@ -933,8 +936,39 @@ final class Knabbel_E2E_Suite {
 			);
 			$this->assert_same( 1, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'A custom prompt must accept the first output.' );
 		} finally {
-			update_option( 'knabbel_settings', $settings );
-			delete_option( 'knabbel_e2e_ai_outputs' );
+			$this->restore_options( $snapshot );
+		}
+	}
+
+	/**
+	 * Captures options, including whether they exist.
+	 *
+	 * @param array<int, string> $names Option names.
+	 * @return array<string, array{0: bool, 1: mixed}> Existence flag and value per option.
+	 */
+	private function snapshot_options( array $names ): array {
+		$missing  = new stdClass();
+		$snapshot = array();
+		foreach ( $names as $name ) {
+			$value             = get_option( $name, $missing );
+			$snapshot[ $name ] = array( $missing !== $value, $missing === $value ? null : $value );
+		}
+
+		return $snapshot;
+	}
+
+	/**
+	 * Restores options captured by snapshot_options().
+	 *
+	 * @param array<string, array{0: bool, 1: mixed}> $snapshot Captured options.
+	 */
+	private function restore_options( array $snapshot ): void {
+		foreach ( $snapshot as $name => list( $exists, $value ) ) {
+			if ( $exists ) {
+				update_option( $name, $value );
+			} else {
+				delete_option( $name );
+			}
 		}
 	}
 
