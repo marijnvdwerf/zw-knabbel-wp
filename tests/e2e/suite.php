@@ -1183,10 +1183,28 @@ final class Knabbel_E2E_Suite {
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
 		$this->set_lost_babbel_responses( array() );
 		$this->assert_babbel_response_code( 404, 'GET', '/stories/' . $story_id );
+		$dates_before = KnabbelWP\calculate_story_dates( 'now' );
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$dates_after = KnabbelWP\calculate_story_dates( 'now' );
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Re-enabling after an unanswered delete must restore the story.' );
-		$this->assert_babbel_response_code( 200, 'GET', '/stories/' . $story_id );
+		$this->assert_story_dates_in_window(
+			$this->get_babbel_story( $story_id ),
+			$dates_before,
+			$dates_after,
+			'A story restored after an unanswered delete must get a new window.'
+		);
 		$this->assert_synced( $post_id, 'A verified restore must clear the failure.' );
+
+		// A delete that went unanswered while the post no longer wants a story clears on the next save.
+		KnabbelWP\update_story_state( $post_id, array( 'window_base' => $this->past_post_date( 30 ) ) );
+		$this->set_lost_babbel_responses( array( 'DELETE' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->set_lost_babbel_responses( array() );
+		$this->update_post( $post_id, array() );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'A verified delete must end in the deleted state.' );
+		$this->assert_synced( $post_id, 'An ordinary save must clear a resolved delete failure.' );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'Precondition: re-enabling must restore the story.' );
 
 		// A restore Babbel applied without answering does not keep a disabled story live.
 		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );

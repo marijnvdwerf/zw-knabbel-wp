@@ -162,6 +162,9 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 			// Only these states can have a pending processing action.
 			\as_unschedule_all_actions( 'knabbel_process_story', array( 'post_id' => $post_id ), 'zw-knabbel-wp' );
 			delete_post_meta( $post_id, '_zw_knabbel_story_state' );
+		} elseif ( StoryStatus::Deleted->value === $status && null !== get_story_sync_error( $state ) ) {
+			// The story is gone, as the post wants, so an earlier failure is moot.
+			mark_story_synced( $post_id );
 		}
 		return false;
 	}
@@ -633,10 +636,12 @@ function verify_remote_story( int $post_id, string $story_id ): bool {
 	}
 
 	if ( 404 === ( $fetched['status_code'] ?? 0 ) ) {
+		// Like a confirmed delete: a later publication starts a new window.
 		update_story_state(
 			$post_id,
 			array(
 				'status'            => StoryStatus::Deleted->value,
+				'window_base'       => null,
 				'remote_unverified' => null,
 			)
 		);
