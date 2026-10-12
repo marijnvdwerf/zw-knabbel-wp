@@ -17,8 +17,9 @@ parameters:
     StoryData: 'array{title: string, text: string, start_date: string, end_date: string, status?: string, weekdays?: int, metadata?: array<string, mixed>}'
     StoryUpdateData: 'array{title?: string, start_date?: string, end_date?: string, weekdays?: int, status?: string}'
     LastSyncError: 'array{message: string, occurred_at: string, operation: string}'
-    StoryState: 'array{status?: string, story_id?: string, status_changed_at?: string, message?: string, generated_speech_text?: string, post_id?: int, last_sync_error?: LastSyncError, synced?: StoryUpdateData, window_base?: string, sync_retry_attempts?: int, remote_unverified?: string, restore_requested?: bool, expired_reset?: bool}'
-    StoryStateUpdate: 'array{status?: string, story_id?: string, message?: string, generated_speech_text?: string, last_sync_error?: LastSyncError|null, synced?: StoryUpdateData|null, window_base?: string|null, sync_retry_attempts?: int|null, remote_unverified?: string|null, restore_requested?: bool|null, expired_reset?: bool|null}'
+    PendingCreate: 'array{id: string, since: int, window_base: string|null, speech_text: string}'
+    StoryState: 'array{status?: string, story_id?: string, status_changed_at?: string, message?: string, generated_speech_text?: string, post_id?: int, last_sync_error?: LastSyncError, synced?: StoryUpdateData, window_base?: string, sync_retry_attempts?: int, remote_unverified?: string, restore_requested?: bool, expired_reset?: bool, pending_create?: PendingCreate}'
+    StoryStateUpdate: 'array{status?: string, story_id?: string, message?: string, generated_speech_text?: string, last_sync_error?: LastSyncError|null, synced?: StoryUpdateData|null, window_base?: string|null, sync_retry_attempts?: int|null, remote_unverified?: string|null, restore_requested?: bool|null, expired_reset?: bool|null, pending_create?: PendingCreate|null}'
     RecentError: 'array{timestamp: string, component: string, message: string, context: array<string, mixed>}'
     # Few-shot types
     FewShotCandidate: 'array{post_id: int, input: string, output: string, edit_score: float, original_word_count: int, output_word_count: int, sentence_count: int, provenance: "accepted"|"edited"}'

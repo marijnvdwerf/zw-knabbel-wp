@@ -300,8 +300,9 @@ function babbel_create_story( array $story_data ): array {
 			)
 		);
 		return array(
-			'success' => false,
-			'message' => babbel_error_message( $response_code, $body ),
+			'success'     => false,
+			'message'     => babbel_error_message( $response_code, $body ),
+			'status_code' => $response_code,
 		);
 	}
 
@@ -716,6 +717,92 @@ function babbel_restore_story( string $story_id, array $fields = array() ): arra
 		'message' => __( 'Story restored successfully', 'zw-knabbel-wp' ),
 		// PATCH returns the restored story.
 		'story'   => is_array( $story ) ? $story : array(),
+	);
+}
+
+/**
+ * Looks up the story a create attempt made, by the token in its metadata.
+ *
+ * Reads the stories created within ten minutes of the attempt, deleted ones
+ * included, newest first, and returns the one whose metadata carries the
+ * token. The window is fixed, so later stories never push it out of reach,
+ * and at most three pages are read, so the lookup fits in a sync lock; a
+ * search that runs into that limit fails rather than report that there is
+ * none.
+ *
+ * @since 0.9.0
+ * @param string $create_id The token the create attempt sent as `knabbel_create_id`.
+ * @param int    $since     Unix time just before the attempt.
+ * @return array{success: bool, message: string, story?: array<string, mixed>} On success, `story` when one was found.
+ *         A found story that was deleted since carries `deleted_at`.
+ *
+ * @phpstan-return BabbelApiResponse
+ */
+function babbel_find_created_story( string $create_id, int $since ): array {
+	$credentials = babbel_get_credentials();
+	// Ten minutes of margin on each side cover a clock difference between WordPress and Babbel.
+	$after  = gmdate( 'Y-m-d\TH:i:s\Z', $since - 600 );
+	$before = gmdate( 'Y-m-d\TH:i:s\Z', $since + 600 );
+
+	for ( $page = 0; $page < 3; $page++ ) {
+		$endpoint = add_query_arg(
+			rawurlencode_deep(
+				array(
+					'trashed'                 => 'with',
+					'filter[created_at][gte]' => $after,
+					'filter[created_at][lte]' => $before,
+					'sort'                    => '-created_at',
+					'limit'                   => 100,
+					'offset'                  => 100 * $page,
+				)
+			),
+			$credentials['base_url'] . '/stories'
+		);
+		$response = babbel_make_authenticated_request(
+			$endpoint,
+			array(
+				'method'  => 'GET',
+				'timeout' => 30,
+			)
+		);
+		if ( is_wp_error( $response ) ) {
+			return array(
+				'success' => false,
+				'message' => __( 'API connection failed: ', 'zw-knabbel-wp' ) . $response->get_error_message(),
+			);
+		}
+
+		$response_code = wp_remote_retrieve_response_code( $response );
+		$body          = wp_remote_retrieve_body( $response );
+		$decoded       = json_decode( $body, true );
+		if ( 200 !== $response_code || ! is_array( $decoded ) || ! is_array( $decoded['data'] ?? null ) ) {
+			return array(
+				'success'     => false,
+				'message'     => 200 !== $response_code ? babbel_error_message( $response_code, $body ) : __( 'Invalid API response', 'zw-knabbel-wp' ),
+				'status_code' => $response_code,
+			);
+		}
+
+		foreach ( $decoded['data'] as $story ) {
+			if ( is_array( $story ) && ( $story['metadata']['knabbel_create_id'] ?? null ) === $create_id ) {
+				return array(
+					'success' => true,
+					'message' => __( 'Story read successfully', 'zw-knabbel-wp' ),
+					'story'   => $story,
+				);
+			}
+		}
+		if ( 100 > count( $decoded['data'] ) ) {
+			return array(
+				'success' => true,
+				'message' => __( 'Story read successfully', 'zw-knabbel-wp' ),
+			);
+		}
+	}
+
+	return array(
+		'success' => false,
+		'message' => __( 'Too many new stories in Babbel to look up the created story', 'zw-knabbel-wp' ),
 	);
 }
 

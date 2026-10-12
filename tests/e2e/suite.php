@@ -119,7 +119,8 @@ final class Knabbel_E2E_Suite {
 			fn () => $this->with_two_step_restore( $this->test_restore_window( ... ) )
 		);
 		$this->run_case( 'E2E-023', 'an embargoed story is never selectable for a bulletin before its window', $this->test_embargo_never_selectable( ... ) );
-		$this->run_case( 'E2E-024', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-024', 'a create whose answer was lost adopts the story Babbel made', $this->test_lost_create_answer( ... ) );
+		$this->run_case( 'E2E-025', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -958,6 +959,28 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( 0, $requests, 'Disabling must not call Babbel for an already deleted story.' );
 		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Disabling must end in the deleted state.' );
 		$this->assert_synced( $post_id, 'Disabling must clear the warning.' );
+
+		// A restore requested while another sync holds the lock is taken over by the deferred sync.
+		list( $held_id, $held_story_id ) = $this->create_sent_story(
+			'E2E herstel tijdens andere sync',
+			'Het herstel wordt gevraagd terwijl een andere synchronisatie loopt.'
+		);
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . $held_story_id );
+		$this->update_post( $held_id, array( 'post_title' => 'E2E herstel tijdens andere sync bewerkt' ) );
+		$this->assert_story_status( $held_id, StoryStatus::DeletedInBabbel, 'Precondition: the story must be deleted in Babbel.' );
+		$this->insert_sync_lock( $held_id, time() + 600 );
+		try {
+			KnabbelWP\restore_story_deleted_in_babbel( $held_id );
+			$this->assert_same(
+				null,
+				KnabbelWP\get_story_state( $held_id )['restore_requested'] ?? null,
+				'Only a sync holding the lock may record the request.'
+			);
+		} finally {
+			$this->delete_sync_lock( $held_id );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $held_id ) );
+		$this->assert_story_status( $held_id, StoryStatus::Sent, 'The deferred sync must restore the story.' );
 
 		// An editor's restore that fails is kept and finished by the retry.
 		list( $retry_id, $retry_story_id ) = $this->create_sent_story(
@@ -2467,6 +2490,306 @@ final class Knabbel_E2E_Suite {
 		} finally {
 			remove_filter( 'pre_http_request', $reject, 1 );
 		}
+	}
+
+	/**
+	 * Verifies that a create Babbel carried out without answering is adopted (#107).
+	 */
+	private function test_lost_create_answer(): void {
+		// The answer is lost: the story Babbel made becomes the post's story, and no second one appears.
+		$title   = 'E2E aanmaken zonder antwoord';
+		$post_id = $this->create_enabled_draft( $title, 'Babbel maakt het verhaal, maar het antwoord gaat verloren.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+		}
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The story Babbel made must be adopted.' );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same( false, isset( $state['pending_create'] ), 'An adopted create must not stay pending.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Nothing may be queued again.' );
+		$this->assert_same( true, '' !== (string) ( $state['generated_speech_text'] ?? '' ), 'The speech text must be kept.' );
+
+		// A reschedule while the answer is lost reaches the adopted story.
+		$title   = 'E2E aanmaken zonder antwoord verplaatst';
+		$post_id = $this->create_enabled_draft( $title, 'Tijdens het aanmaken krijgt het artikel een embargo.' );
+		$this->schedule_post( $post_id, $this->future_post_date( 2 ) );
+		$embargo    = $this->future_post_date( 10 );
+		$reschedule = function ( $response, array $args, string $url ) use ( $post_id, $embargo ) {
+			static $done = false;
+			if ( ! $done && 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
+				$done = true;
+				$this->schedule_post( $post_id, $embargo );
+			}
+			return $response;
+		};
+		add_filter( 'http_response', $reschedule, 0, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_filter( 'http_response', $reschedule, 0 );
+		}
+		// The save during the create waited for it; the deferred sync finds nothing left to do.
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The adopted story must stay the post\'s story.' );
+		$story_id = (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' );
+		$this->assert_same(
+			KnabbelWP\calculate_story_dates( $embargo )['start_date'],
+			substr( (string) ( $this->get_babbel_story( $story_id )['start_date'] ?? '' ), 0, 10 ),
+			'The adopted story must get the window of the reschedule.'
+		);
+		$this->update_post( $post_id, array() );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'No further create may be queued.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// A save from the state-change hook, as the attempt is recorded, waits for the create too.
+		$title     = 'E2E aanmaken zonder antwoord via hook';
+		$post_id   = $this->create_enabled_draft( $title, 'Een hook slaat het artikel op zodra de poging wordt vastgelegd.' );
+		$on_record = function ( $id, $new_state, $old_state ) use ( $post_id, $title ) {
+			static $done = false;
+			if ( ! $done && $post_id === $id && isset( $new_state['pending_create'] ) && ! isset( $old_state['pending_create'] ) ) {
+				$done = true;
+				$this->update_post( $post_id, array( 'post_title' => $title . ' bewerkt' ) );
+			}
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_action( 'knabbel_story_state_changed', $on_record, 10, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_action( 'knabbel_story_state_changed', $on_record, 10 );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The story must be adopted after the hook\'s save.' );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'No further create may be queued.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' bewerkt' ), 'The adopted story must get the saved title.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// Unpublishing before Babbel commits waits for the create, so the story made is deleted again.
+		$title     = 'E2E aanmaken zonder antwoord ingetrokken';
+		$post_id   = $this->create_enabled_draft( $title, 'Het artikel wordt ingetrokken terwijl Babbel het verhaal maakt.' );
+		$unpublish = function ( $preempt, array $args, string $url ) use ( $post_id ) {
+			static $done = false;
+			if ( ! $done && 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
+				$done = true;
+				$this->update_post( $post_id, array( 'post_status' => 'draft' ) );
+			}
+			return $preempt;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $unpublish, 0, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_filter( 'pre_http_request', $unpublish, 0 );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'The story made for an unpublished post must be deleted.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'No live story may remain.' );
+
+		// The lookup fails: the attempt stays pending, nothing is created again before it is looked up.
+		$title     = 'E2E aanmaken zonder antwoord en opzoeking';
+		$post_id   = $this->create_enabled_draft( $title, 'Ook de opzoeking mislukt eerst.' );
+		$fail_find = static function ( $preempt, array $args, string $url ) {
+			if ( 'GET' === ( $args['method'] ?? 'GET' ) && str_contains( rawurldecode( $url ), 'filter[created_at][gte]' ) ) {
+				return new WP_Error( 'http_request_failed', 'E2E: Babbel is unreachable' );
+			}
+			return $preempt;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $fail_find, 1, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+			$state = KnabbelWP\get_story_state( $post_id );
+			$this->assert_same(
+				array( StoryStatus::Error->value, true, 1 ),
+				array( $state['status'] ?? null, isset( $state['pending_create'] ), $this->sync_retry_count( $post_id ) ),
+				'A failed lookup must keep the attempt pending and retry.'
+			);
+			// A save looks up first, and queues no new create while that fails.
+			$this->update_post( $post_id, array( 'post_title' => $title ) );
+			$this->assert_same( 0, $this->story_action_count( $post_id ), 'A save must not queue a create while the lookup fails.' );
+			$this->assert_same( true, isset( KnabbelWP\get_story_state( $post_id )['pending_create'] ), 'The attempt must stay pending.' );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_filter( 'pre_http_request', $fail_find, 1 );
+		}
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may be created while the lookup fails.' );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The retry must adopt the story.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'Still no second story.' );
+
+		// Another worker's attempt, made during this worker's generation, is settled before this one creates.
+		$title     = 'E2E aanmaken door een andere worker';
+		$post_id   = $this->create_enabled_draft( $title, 'Een andere worker maakt het verhaal tijdens het genereren.' );
+		$token     = wp_generate_uuid4();
+		$dates     = KnabbelWP\calculate_story_dates( 'now' );
+		$other_id  = 0;
+		$interject = function ( $preempt, array $args, string $url ) use ( $post_id, $title, $token, $dates, &$other_id ) {
+			if ( 0 === $other_id && 'https://api.openai.com/v1/responses' === $url ) {
+				$made     = $this->babbel_request(
+					'POST',
+					'/stories',
+					array(
+						'title'      => $title,
+						'text'       => 'Gemaakt door een andere worker.',
+						'start_date' => $dates['start_date'],
+						'end_date'   => $dates['end_date'],
+						'weekdays'   => 127,
+						'metadata'   => array( 'knabbel_create_id' => $token ),
+					)
+				);
+				$other_id = (int) ( json_decode( wp_remote_retrieve_body( $made ), true )['id'] ?? -1 );
+				KnabbelWP\update_story_state(
+					$post_id,
+					array(
+						'status'         => StoryStatus::Error->value,
+						'pending_create' => array(
+							'id'          => $token,
+							'since'       => time(),
+							'window_base' => current_time( 'mysql' ),
+							'speech_text' => 'Gemaakt door een andere worker.',
+						),
+					)
+				);
+			}
+			return $preempt;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $interject, 5, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $interject, 5 );
+		}
+		$this->assert_same( true, $other_id > 0, 'Precondition: the other worker must have made a story.' );
+		$this->assert_same(
+			(string) $other_id,
+			(string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' ),
+			'The other worker\'s story must be adopted.'
+		);
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// An attempt already pending when a worker starts is settled first, under the lock.
+		$title   = 'E2E aanmaken door een eerdere worker';
+		$token   = wp_generate_uuid4();
+		$made    = $this->babbel_request(
+			'POST',
+			'/stories',
+			array(
+				'title'      => $title,
+				'text'       => 'Gemaakt door een eerdere worker.',
+				'start_date' => $dates['start_date'],
+				'end_date'   => $dates['end_date'],
+				'weekdays'   => 127,
+				'metadata'   => array( 'knabbel_create_id' => $token ),
+			)
+		);
+		$made_id = (string) ( json_decode( wp_remote_retrieve_body( $made ), true )['id'] ?? '' );
+		$post_id = $this->create_enabled_draft( $title, 'Een eerdere worker maakte het verhaal al.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		KnabbelWP\update_story_state(
+			$post_id,
+			array(
+				'pending_create' => array(
+					'id'          => $token,
+					'since'       => time(),
+					'window_base' => current_time( 'mysql' ),
+					'speech_text' => 'Gemaakt door een eerdere worker.',
+				),
+			)
+		);
+		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_same( $made_id, (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' ), 'The earlier worker\'s story must be adopted.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// A story deleted in Babbel before the lookup succeeds is recorded as such, not replaced (#93).
+		$title   = 'E2E aanmaken zonder antwoord en verwijderd';
+		$post_id = $this->create_enabled_draft( $title, 'Het gemaakte verhaal wordt verwijderd voordat de plugin het vindt.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $fail_find, 1, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_filter( 'pre_http_request', $fail_find, 1 );
+		}
+		$made = $this->babbel_get_json( '/stories?' . http_build_query( array( 'filter' => array( 'title' => $title ) ) ), 'The made story must be listed.' );
+		$this->assert_babbel_response_code( 204, 'DELETE', '/stories/' . ( $made['data'][0]['id'] ?? 0 ) );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::DeletedInBabbel, 'A made story deleted in Babbel must be recorded as such.' );
+		$this->assert_same( 0, $this->story_action_count( $post_id ), 'It must not be replaced.' );
+
+		// A lookup that runs into its page limit decides nothing.
+		$title     = 'E2E aanmaken zonder antwoord en volle lijst';
+		$post_id   = $this->create_enabled_draft( $title, 'Babbel heeft meer nieuwe verhalen dan de opzoeking leest.' );
+		$full_list = static function ( $preempt, array $args, string $url ) {
+			if ( 'GET' !== ( $args['method'] ?? 'GET' ) || ! str_contains( rawurldecode( $url ), 'filter[created_at][gte]' ) ) {
+				return $preempt;
+			}
+			$other = array_fill( 0, 100, array( 'metadata' => array( 'knabbel_create_id' => 'another attempt' ) ) );
+			return array(
+				'headers'  => array( 'content-type' => 'application/json' ),
+				'body'     => (string) wp_json_encode( array( 'data' => $other ) ),
+				'response' => array(
+					'code'    => 200,
+					'message' => 'OK',
+				),
+				'cookies'  => array(),
+			);
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $full_list, 1, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_filter( 'pre_http_request', $full_list, 1 );
+		}
+		$this->assert_same( true, isset( KnabbelWP\get_story_state( $post_id )['pending_create'] ), 'A truncated lookup must keep the attempt pending.' );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'A complete lookup must then adopt the story.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// The request never reached Babbel: nothing is found, and the next run creates the story.
+		$title    = 'E2E aanmaken zonder verhaal';
+		$post_id  = $this->create_enabled_draft( $title, 'Het verzoek komt nooit aan bij Babbel.' );
+		$no_reach = static function ( $preempt, array $args, string $url ) {
+			if ( 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
+				return new WP_Error( 'http_request_failed', 'E2E: the request never arrived' );
+			}
+			return $preempt;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $no_reach, 1, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $no_reach, 1 );
+		}
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( StoryStatus::Error->value, false ),
+			array( $state['status'] ?? null, isset( $state['pending_create'] ) ),
+			'A create Babbel never made must end in an error without a pending attempt.'
+		);
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Precondition: Babbel has no story.' );
+		$this->update_post( $post_id, array( 'post_title' => $title ) );
+		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The next run must create the story.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'Exactly one story must exist.' );
 	}
 
 	/**

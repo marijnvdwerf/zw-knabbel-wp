@@ -25,6 +25,8 @@ const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
 // again), each with up to two logins and two requests of 30 seconds: 1080 seconds.
 const STORY_SYNC_LOCK_TTL      = 1500;
 const STORY_SYNC_DEFERRED_HOOK = 'knabbel_deferred_story_sync';
+// Post meta for an editor's request to restore a story deleted in Babbel, until a sync takes it over.
+const RESTORE_REQUEST_META_KEY = '_zw_knabbel_restore_request';
 
 /**
  * Registers post and metadata hooks.
@@ -124,7 +126,35 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): bool {
 		return false;
 	}
 
-	$state    = get_story_state( $post_id );
+	// A save made while this request creates the story, from a hook for example, waits for the answer.
+	if ( story_create_in_flight( $post_id ) ) {
+		defer_story_sync( $post_id );
+		return false;
+	}
+
+	$state = get_story_state( $post_id );
+	// An editor's restore request applies to a story still deleted in Babbel. The request is kept in
+	// the state, so a retry finishes it; a restore starts a new window, as after any delete.
+	if ( get_post_meta( $post_id, RESTORE_REQUEST_META_KEY, true ) ) {
+		delete_post_meta( $post_id, RESTORE_REQUEST_META_KEY );
+		if ( StoryStatus::DeletedInBabbel->value === ( $state['status'] ?? '' ) ) {
+			update_story_state(
+				$post_id,
+				array(
+					'restore_requested' => true,
+					'window_base'       => null,
+				)
+			);
+			$state = get_story_state( $post_id );
+		}
+	}
+	// A create whose answer was lost may have made the story: settle that before anything else.
+	if ( ! empty( $state['pending_create'] ) ) {
+		if ( null === resolve_pending_create( $post_id ) ) {
+			return true;
+		}
+		$state = get_story_state( $post_id );
+	}
 	$story_id = (string) ( $state['story_id'] ?? '' );
 	if ( '' !== $story_id && ! empty( $state['remote_unverified'] ) ) {
 		if ( ! verify_remote_story( $post_id, $story_id ) ) {
@@ -514,19 +544,9 @@ function schedule_story_sync_at_next_day( int $post_id ): void {
  * @param int $post_id Post ID.
  */
 function restore_story_deleted_in_babbel( int $post_id ): void {
-	$state = get_story_state( $post_id );
-	if ( StoryStatus::DeletedInBabbel->value !== ( $state['status'] ?? '' ) ) {
-		return;
-	}
-
-	// The request is kept, so a retry finishes it; a restore starts a new window, as after any delete.
-	update_story_state(
-		$post_id,
-		array(
-			'restore_requested' => true,
-			'window_base'       => null,
-		)
-	);
+	// Only the request is recorded here, in its own field: the sync takes it over under the lock,
+	// against fresh state, so this request never writes a story state it read before.
+	update_post_meta( $post_id, RESTORE_REQUEST_META_KEY, 1 );
 	retry_story_sync( $post_id );
 }
 
@@ -1042,6 +1062,93 @@ function bring_back_deleted_story( int $post_id, string $story_id, \WP_Post $pos
 	);
 	delete_post_meta( $post_id, '_zw_knabbel_story_state' );
 	schedule_story_processing( $post_id );
+}
+
+/**
+ * Marks or reports a create request this request has not had an answer to yet.
+ *
+ * The sync lock is re-entrant within a request, so this keeps a sync started
+ * from inside the create, by a hook for example, from settling or clearing
+ * the attempt early.
+ *
+ * @since 0.9.0
+ *
+ * @param int       $post_id Post ID.
+ * @param bool|null $flying  True when the create starts, false when it is answered; null only reports.
+ * @return bool True while the create is outstanding.
+ */
+function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
+	static $posts = array();
+	if ( true === $flying ) {
+		$posts[ $post_id ] = true;
+	} elseif ( false === $flying ) {
+		unset( $posts[ $post_id ] );
+	}
+
+	return isset( $posts[ $post_id ] );
+}
+
+/**
+ * Settles a create attempt whose answer was lost.
+ *
+ * Babbel may have created the story anyway. It is looked up by the token the
+ * attempt sent in its metadata and, when found, adopted as the post's story,
+ * so the post never gets a second one and the first does not stay behind with
+ * an old window. When Babbel has none, nothing was created and a new attempt
+ * may follow; when the lookup fails, the attempt stays pending and is retried.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id Post ID.
+ * @return bool|null True when the story was adopted, false when Babbel has none, null when the lookup failed.
+ */
+function resolve_pending_create( int $post_id ): ?bool {
+	$pending = get_story_state( $post_id )['pending_create'] ?? null;
+	if ( ! is_array( $pending ) ) {
+		return false;
+	}
+
+	$found = babbel_find_created_story( $pending['id'], $pending['since'] );
+	if ( ! $found['success'] ) {
+		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $found['message'], 'create' ) ) );
+		schedule_story_sync_retry( $post_id );
+		return null;
+	}
+
+	$story = $found['story'] ?? null;
+	if ( ! is_array( $story ) || ! is_scalar( $story['id'] ?? null ) ) {
+		update_story_state( $post_id, array( 'pending_create' => null ) );
+		return false;
+	}
+
+	log(
+		'info',
+		'PostHooks',
+		'Adopting the story an unanswered create made',
+		array(
+			'post_id'  => $post_id,
+			'story_id' => (string) $story['id'],
+		)
+	);
+	update_story_state(
+		$post_id,
+		array(
+			'status'                => StoryStatus::Sent->value,
+			'story_id'              => (string) $story['id'],
+			'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
+			'generated_speech_text' => $pending['speech_text'],
+			'last_sync_error'       => null,
+			'pending_create'        => null,
+			// Without readable fields, the next comparison reads the story first.
+			'synced'                => story_fields_from_babbel( $story ),
+			'window_base'           => $pending['window_base'],
+		)
+	);
+	// Deleted in Babbel since it was made: that deletion was made outside WordPress (#93).
+	if ( ! empty( $story['deleted_at'] ) ) {
+		record_story_gone( $post_id, (string) $story['id'], 'story.deleted', 'The created story was deleted in Babbel' );
+	}
+	return true;
 }
 
 /**
