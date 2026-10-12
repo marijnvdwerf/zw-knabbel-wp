@@ -1096,14 +1096,15 @@ function bring_back_deleted_story( int $post_id, string $story_id, \WP_Post $pos
  * @since 0.9.0
  *
  * @param int       $post_id Post ID.
- * @param bool|null $flying  True when the create starts, false when it is answered; null only reports.
+ * @param bool|null $flying  True when a create starts, false when it and its handling end; null only reports.
  * @return bool True while the create is outstanding.
  */
 function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
+	// A count, so a repeat settled inside the worker's own create keeps the worker's mark.
 	static $posts = array();
 	if ( true === $flying ) {
-		$posts[ $post_id ] = true;
-	} elseif ( false === $flying ) {
+		$posts[ $post_id ] = ( $posts[ $post_id ] ?? 0 ) + 1;
+	} elseif ( false === $flying && isset( $posts[ $post_id ] ) && 0 === --$posts[ $post_id ] ) {
 		unset( $posts[ $post_id ] );
 	}
 

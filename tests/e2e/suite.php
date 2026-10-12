@@ -2640,6 +2640,40 @@ final class Knabbel_E2E_Suite {
 		);
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
 
+		// A save from the state-change hook while the repeat's error is recorded waits for the worker, so
+		// the worker's outcome never overwrites an adoption, and the first story keeps the post.
+		$title    = 'E2E aanmaken met sleutel en opslaan bij de fout';
+		$post_id  = $this->create_enabled_draft( $title, 'Een hook slaat het artikel op zodra de fout wordt vastgelegd.' );
+		$on_error = function ( $id, $new_state, $old_state ) use ( $post_id, $title ) {
+			static $done = false;
+			$recorded    = isset( $new_state['pending_create'], $new_state['last_sync_error'] ) && ! isset( $old_state['last_sync_error'] );
+			if ( ! $done && $post_id === $id && $recorded ) {
+				$done = true;
+				$this->update_post( $post_id, array( 'post_title' => $title . ' bewerkt' ) );
+			}
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_action( 'knabbel_story_state_changed', $on_error, 10, 3 );
+		$this->set_lost_babbel_responses( array( 'POST' ) );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			$this->set_lost_babbel_responses( array() );
+			remove_action( 'knabbel_story_state_changed', $on_error, 10 );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The deferred save must adopt the story.' );
+		$embargo = $this->future_post_date( 10 );
+		$this->schedule_post( $post_id, $embargo );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' bewerkt' ), 'The first story must keep the post, with the saved title.' );
+		$story_id = (string) ( KnabbelWP\get_story_state( $post_id )['story_id'] ?? '' );
+		$this->assert_same(
+			KnabbelWP\calculate_story_dates( $embargo )['start_date'],
+			substr( (string) ( $this->get_babbel_story( $story_id )['start_date'] ?? '' ), 0, 10 ),
+			'Later window changes must reach the first story.'
+		);
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
 		// The stored request keeps backslashes, so the repeat sends exactly the first request.
 		$title   = 'E2E aanmaken met \\ in de titel';
 		$post_id = $this->create_enabled_draft( 'Concept', 'Een titel met een backslash.' );

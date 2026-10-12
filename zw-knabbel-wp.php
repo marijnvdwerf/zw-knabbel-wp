@@ -842,6 +842,8 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 		'speech_text' => $speech_text,
 		'request'     => $story_data,
 	);
+	// The mark lasts until the outcome is recorded: a save in between, from a hook for example, waits,
+	// so it can neither settle the attempt early nor have its result overwritten.
 	story_create_in_flight( $post_id, true );
 	try {
 		// An attempt that could not be recorded could never be found again if its answer were lost.
@@ -852,61 +854,61 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 			$pending['since'] = time();
 			$result           = update_story_state( $post_id, array( 'pending_create' => $pending ) ) ? babbel_create_story( $story_data ) : null;
 		}
+
+		if ( null === $result ) {
+			update_story_state(
+				$post_id,
+				array(
+					'status'  => \KnabbelWP\StoryStatus::Error->value,
+					'message' => __( 'Could not record the create attempt; the story was not sent', 'zw-knabbel-wp' ),
+				)
+			);
+			return;
+		}
+
+		if ( $result['success'] ) {
+			update_story_state(
+				$post_id,
+				array(
+					'status'                => \KnabbelWP\StoryStatus::Sent->value,
+					'story_id'              => $result['story_id'],
+					'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
+					'generated_speech_text' => $speech_text,
+					'last_sync_error'       => null,
+					// What Babbel confirmed, and when a published story went live.
+					'synced'                => array(
+						'title'      => $title,
+						'start_date' => $dates['start_date'],
+						'end_date'   => $dates['end_date'],
+						'weekdays'   => $dates['weekdays'],
+					),
+					'window_base'           => 'future' === $post->post_status ? null : $base_date,
+					'pending_create'        => null,
+				)
+			);
+		} else {
+			// An unanswered create may have made the story; a rejected one made nothing.
+			$adopted = babbel_write_uncertain( $result ) ? resolve_pending_create( $post_id ) : false;
+		}
+		if ( ! $result['success'] && true !== $adopted ) {
+			$error_state = array(
+				'status'  => \KnabbelWP\StoryStatus::Error->value,
+				'message' => $result['message'],
+			);
+			// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
+			if ( null !== $adopted ) {
+				$error_state['last_sync_error'] = build_story_sync_error( $result['message'], 'create' );
+				$error_state['pending_create']  = null;
+			}
+			update_story_state( $post_id, $error_state );
+			return;
+		}
 	} finally {
 		story_create_in_flight( $post_id, false );
 	}
-	if ( null === $result ) {
-		update_story_state(
-			$post_id,
-			array(
-				'status'  => \KnabbelWP\StoryStatus::Error->value,
-				'message' => __( 'Could not record the create attempt; the story was not sent', 'zw-knabbel-wp' ),
-			)
-		);
-		return;
-	}
 
-	if ( $result['success'] ) {
-		update_story_state(
-			$post_id,
-			array(
-				'status'                => \KnabbelWP\StoryStatus::Sent->value,
-				'story_id'              => $result['story_id'],
-				'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
-				'generated_speech_text' => $speech_text,
-				'last_sync_error'       => null,
-				// What Babbel confirmed, and when a published story went live.
-				'synced'                => array(
-					'title'      => $title,
-					'start_date' => $dates['start_date'],
-					'end_date'   => $dates['end_date'],
-					'weekdays'   => $dates['weekdays'],
-				),
-				'window_base'           => 'future' === $post->post_status ? null : $base_date,
-				'pending_create'        => null,
-			)
-		);
-		// Saves during generation and creation found no story to update, so bring it in line now.
-		sync_story_state( $post_id );
-		return;
-	}
-
-	// An unanswered create may have made the story; a rejected one made nothing.
-	$adopted = babbel_write_uncertain( $result ) ? resolve_pending_create( $post_id ) : false;
-	if ( true === $adopted ) {
-		sync_story_state( $post_id );
-		return;
-	}
-	$error_state = array(
-		'status'  => \KnabbelWP\StoryStatus::Error->value,
-		'message' => $result['message'],
-	);
-	// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
-	if ( null !== $adopted ) {
-		$error_state['last_sync_error'] = build_story_sync_error( $result['message'], 'create' );
-		$error_state['pending_create']  = null;
-	}
-	update_story_state( $post_id, $error_state );
+	// Saves during generation and creation waited for the outcome, so bring the story in line now.
+	sync_story_state( $post_id );
 }
 
 /**
