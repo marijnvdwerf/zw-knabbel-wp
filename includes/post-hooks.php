@@ -25,6 +25,9 @@ const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
 // again), each with up to two logins and two requests of 30 seconds: 1080 seconds.
 const STORY_SYNC_LOCK_TTL      = 1500;
 const STORY_SYNC_DEFERRED_HOOK = 'knabbel_deferred_story_sync';
+// Seconds after which a create whose answer was lost can no longer commit in Babbel; until then, a
+// lookup that finds nothing keeps the attempt pending.
+const PENDING_CREATE_SETTLE_SECONDS = 900;
 // Post meta for an editor's request to restore a story deleted in Babbel, until a sync takes it over.
 const RESTORE_REQUEST_META_KEY = '_zw_knabbel_restore_request';
 
@@ -1094,8 +1097,9 @@ function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
  * Babbel may have created the story anyway. It is looked up by the token the
  * attempt sent in its metadata and, when found, adopted as the post's story,
  * so the post never gets a second one and the first does not stay behind with
- * an old window. When Babbel has none, nothing was created and a new attempt
- * may follow; when the lookup fails, the attempt stays pending and is retried.
+ * an old window. When Babbel has none once the attempt can no longer commit,
+ * nothing was created and a new attempt may follow; until then, and when the
+ * lookup fails, the attempt stays pending and is retried.
  *
  * @since 0.9.0
  *
@@ -1108,7 +1112,8 @@ function resolve_pending_create( int $post_id ): ?bool {
 		return false;
 	}
 
-	$found = babbel_find_created_story( $pending['id'], $pending['since'] );
+	// Ten minutes of margin on each side cover a clock difference between WordPress and Babbel.
+	$found = babbel_find_created_story( $pending['id'], $pending['since'] - 600, $pending['since'] + PENDING_CREATE_SETTLE_SECONDS + 600 );
 	if ( ! $found['success'] ) {
 		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $found['message'], 'create' ) ) );
 		schedule_story_sync_retry( $post_id );
@@ -1117,6 +1122,16 @@ function resolve_pending_create( int $post_id ): ?bool {
 
 	$story = $found['story'] ?? null;
 	if ( ! is_array( $story ) || ! is_scalar( $story['id'] ?? null ) ) {
+		// A create whose answer was lost may still commit afterwards; until it is old enough, finding
+		// nothing proves nothing, so the attempt stays pending and is looked up again.
+		if ( time() < $pending['since'] + PENDING_CREATE_SETTLE_SECONDS ) {
+			update_story_state(
+				$post_id,
+				array( 'last_sync_error' => build_story_sync_error( __( 'Waiting to see whether Babbel created the story', 'zw-knabbel-wp' ), 'create' ) )
+			);
+			schedule_story_sync_retry( $post_id );
+			return null;
+		}
 		update_story_state( $post_id, array( 'pending_create' => null ) );
 		return false;
 	}

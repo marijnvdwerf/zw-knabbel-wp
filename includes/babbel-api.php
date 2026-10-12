@@ -723,35 +723,34 @@ function babbel_restore_story( string $story_id, array $fields = array() ): arra
 /**
  * Looks up the story a create attempt made, by the token in its metadata.
  *
- * Reads the stories created within ten minutes of the attempt, deleted ones
- * included, newest first, and returns the one whose metadata carries the
- * token. The window is fixed, so later stories never push it out of reach,
+ * Reads the stories created within the given window, deleted ones included,
+ * newest first, and returns the one whose metadata carries the token. The
+ * window is fixed, so later stories never push it out of reach,
  * and at most three pages are read, so the lookup fits in a sync lock; a
  * search that runs into that limit fails rather than report that there is
  * none.
  *
  * @since 0.9.0
  * @param string $create_id The token the create attempt sent as `knabbel_create_id`.
- * @param int    $since     Unix time just before the attempt.
+ * @param int    $after     Unix time from which to look.
+ * @param int    $before    Unix time until which to look.
  * @return array{success: bool, message: string, story?: array<string, mixed>} On success, `story` when one was found.
  *         A found story that was deleted since carries `deleted_at`.
  *
  * @phpstan-return BabbelApiResponse
  */
-function babbel_find_created_story( string $create_id, int $since ): array {
+function babbel_find_created_story( string $create_id, int $after, int $before ): array {
 	$credentials = babbel_get_credentials();
-	// Ten minutes of margin on each side cover a clock difference between WordPress and Babbel.
-	$after  = gmdate( 'Y-m-d\TH:i:s\Z', $since - 600 );
-	$before = gmdate( 'Y-m-d\TH:i:s\Z', $since + 600 );
 
 	for ( $page = 0; $page < 3; $page++ ) {
 		$endpoint = add_query_arg(
 			rawurlencode_deep(
 				array(
 					'trashed'                 => 'with',
-					'filter[created_at][gte]' => $after,
-					'filter[created_at][lte]' => $before,
-					'sort'                    => '-created_at',
+					'filter[created_at][gte]' => gmdate( 'Y-m-d\TH:i:s\Z', $after ),
+					'filter[created_at][lte]' => gmdate( 'Y-m-d\TH:i:s\Z', $before ),
+					// Timestamps have whole seconds, so the ID keeps the pages in one stable order.
+					'sort'                    => '-created_at,-id',
 					'limit'                   => 100,
 					'offset'                  => 100 * $page,
 				)

@@ -2739,15 +2739,47 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'A complete lookup must then adopt the story.' );
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
 
-		// The request never reached Babbel: nothing is found, and the next run creates the story.
-		$title    = 'E2E aanmaken zonder verhaal';
-		$post_id  = $this->create_enabled_draft( $title, 'Het verzoek komt nooit aan bij Babbel.' );
+		// The answer is lost before Babbel commits. Finding nothing proves nothing until the attempt can
+		// no longer commit, so a create that commits late is still adopted.
 		$no_reach = static function ( $preempt, array $args, string $url ) {
 			if ( 'POST' === ( $args['method'] ?? '' ) && str_ends_with( $url, '/stories' ) ) {
 				return new WP_Error( 'http_request_failed', 'E2E: the request never arrived' );
 			}
 			return $preempt;
 		};
+		$lookups  = array();
+		$seen     = static function ( $preempt, array $args, string $url ) use ( &$lookups ) {
+			if ( str_contains( rawurldecode( $url ), 'filter[created_at][gte]' ) ) {
+				$lookups[] = rawurldecode( $url );
+			}
+			return $preempt;
+		};
+		$title    = 'E2E aanmaken dat laat vastligt';
+		$post_id  = $this->create_enabled_draft( $title, 'Babbel legt het verhaal pas vast na de time-out.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'pre_http_request', $no_reach, 1, 3 );
+		add_filter( 'pre_http_request', $seen, 0, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $seen, 0 );
+			remove_filter( 'pre_http_request', $no_reach, 1 );
+		}
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( StoryStatus::Error->value, true, 1 ),
+			array( $state['status'] ?? null, isset( $state['pending_create'] ), $this->sync_retry_count( $post_id ) ),
+			'Finding nothing right after the attempt must keep it pending and retry.'
+		);
+		$this->assert_same( true, str_contains( $lookups[0] ?? '', 'sort=-created_at,-id' ), 'The lookup must page in a stable order.' );
+		$this->create_babbel_story_with_token( $title, 'Pas later vastgelegd.', $state['pending_create']['id'], KnabbelWP\calculate_story_dates( 'now' ) );
+		$this->run_pending_sync_retry( $post_id );
+		$this->assert_story_status( $post_id, StoryStatus::Sent, 'A create that committed late must be adopted.' );
+		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
+
+		// Nothing was ever made: once the attempt can no longer commit, the next run creates the story.
+		$title   = 'E2E aanmaken zonder verhaal';
+		$post_id = $this->create_enabled_draft( $title, 'Het verzoek komt nooit aan bij Babbel.' );
 		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
 		add_filter( 'pre_http_request', $no_reach, 1, 3 );
 		try {
@@ -2755,14 +2787,17 @@ final class Knabbel_E2E_Suite {
 		} finally {
 			remove_filter( 'pre_http_request', $no_reach, 1 );
 		}
+		$pending           = KnabbelWP\get_story_state( $post_id )['pending_create'] ?? array();
+		$pending['since'] -= KnabbelWP\PENDING_CREATE_SETTLE_SECONDS + 1;
+		KnabbelWP\update_story_state( $post_id, array( 'pending_create' => $pending ) );
+		$this->run_pending_sync_retry( $post_id );
 		$state = KnabbelWP\get_story_state( $post_id );
 		$this->assert_same(
-			array( StoryStatus::Error->value, false ),
+			array( StoryStatus::Scheduled->value, false ),
 			array( $state['status'] ?? null, isset( $state['pending_create'] ) ),
-			'A create Babbel never made must end in an error without a pending attempt.'
+			'An attempt that can no longer commit and made nothing must be dropped, and a new one queued.'
 		);
 		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'Precondition: Babbel has no story.' );
-		$this->update_post( $post_id, array( 'post_title' => $title ) );
 		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'The next run must create the story.' );
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'Exactly one story must exist.' );
