@@ -2521,7 +2521,8 @@ final class Knabbel_E2E_Suite {
 	 * Verifies creates repeated with the same idempotency key (#107).
 	 *
 	 * Babbel answers a repeat with the story the first create made, or makes it
-	 * now, so no lost answer can lead to a second story or a wait.
+	 * now, so a lost answer leads to no second story and, once a repeat is
+	 * answered, to no wait.
 	 */
 	private function check_keyed_create_replays(): void {
 		// The answer is lost: the repeat gets the story Babbel made.

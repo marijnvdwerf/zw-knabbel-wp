@@ -1116,13 +1116,14 @@ function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
  *
  * Babbel may have created the story anyway. A Babbel version that keys creates
  * gets the same request again, with the same key: it answers with the story
- * the attempt made, or makes it now. Otherwise the story is looked up by the
- * token the attempt sent in its metadata and, when found, adopted as the
- * post's story,
- * so the post never gets a second one and the first does not stay behind with
- * an old window. When Babbel has none once the attempt is assumed to no longer commit,
- * nothing was created and a new attempt may follow; until then, and when the
- * lookup fails, the attempt stays pending and is retried.
+ * the attempt made, or makes it now, and until a repeat succeeds the attempt
+ * stays pending, so the post gets no second story, though its changes wait.
+ * Otherwise the story is looked up by the token the attempt sent in its
+ * metadata and, when found, adopted as the post's story. When none is found
+ * once the attempt is assumed to no longer commit, nothing is taken to have
+ * been created and a new attempt may follow; a create that commits even later
+ * could still be duplicated. Until then, and when the lookup fails, the
+ * attempt stays pending and is retried.
  *
  * @since 0.9.0
  *
