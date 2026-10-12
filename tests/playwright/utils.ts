@@ -18,6 +18,7 @@ export interface ControlResult {
 
 export interface BabbelStory {
     title: string;
+    start_date?: string;
     text: string;
     status?: string;
     metadata?: {
@@ -78,6 +79,33 @@ export async function login(page: Page): Promise<void> {
 }
 
 export async function savePost(page: Page, button = '#publish'): Promise<void> {
+    await submitPost(page, () =>
+        page.locator(button).evaluate((element) => {
+            const button = element as HTMLButtonElement | HTMLInputElement;
+            if (!button.form) {
+                throw new Error(
+                    'The publish button is not associated with a form.',
+                );
+            }
+            button.form.requestSubmit(button);
+        }),
+    );
+}
+
+/**
+ * Click a submit button of the post form the way an editor does.
+ */
+export async function clickToSavePost(
+    page: Page,
+    button: string,
+): Promise<void> {
+    await submitPost(page, () => page.locator(button).click());
+}
+
+async function submitPost(
+    page: Page,
+    submit: () => Promise<unknown>,
+): Promise<void> {
     const postResponse = page.waitForResponse(
         (response) =>
             response.request().method() === 'POST' &&
@@ -88,19 +116,7 @@ export async function savePost(page: Page, button = '#publish'): Promise<void> {
         (frame) => frame === page.mainFrame(),
     );
 
-    const [response] = await Promise.all([
-        postResponse,
-        navigation,
-        page.locator(button).evaluate((element) => {
-            const button = element as HTMLButtonElement | HTMLInputElement;
-            if (!button.form) {
-                throw new Error(
-                    'The publish button is not associated with a form.',
-                );
-            }
-            button.form.requestSubmit(button);
-        }),
-    ]);
+    const [response] = await Promise.all([postResponse, navigation, submit()]);
     await expectResponseOk(response, 'Post save failed.');
     await expect(page).toHaveURL(/\/wp-admin\/post\.php\?post=\d+&action=edit/);
     await expect(page.locator('#publish')).toBeVisible();

@@ -24,6 +24,7 @@ final class Knabbel_E2E_Suite {
 	private const BABBEL_BASE_URL         = 'http://babbel:8080/api/v1';
 	private const STORY_HOOK              = 'knabbel_process_story';
 	private const SYNC_RETRY_HOOK         = 'knabbel_retry_story_sync';
+	private const DEFERRED_SYNC_HOOK      = 'knabbel_deferred_story_sync';
 	private const FEW_SHOT_HOOK           = 'knabbel_sync_few_shot_examples';
 	private const ACTION_GROUP            = 'zw-knabbel-wp';
 	private const SEND_TO_BABBEL_META_KEY = '_zw_knabbel_send_to_babbel';
@@ -1010,21 +1011,57 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( $title . ' overgenomen', $this->get_babbel_story( $story_id )['title'] ?? null, 'An expired lock must not block a sync.' );
 		$this->assert_same( false, $this->sync_lock_exists( $post_id ), 'Taking over an expired lock must release it afterwards.' );
 
-		// A sync that cannot get a held lock in time still runs, so no save is lost.
+		// A save that finds the lock held by a live sync defers its change instead of syncing unlocked.
 		$this->insert_sync_lock( $post_id, time() + 60 );
 		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
 		try {
-			$this->update_post( $post_id, array( 'post_title' => $title . ' hersteld' ) );
+			$requests = $this->count_babbel_requests(
+				fn () => $this->update_post( $post_id, array( 'post_title' => $title . ' uitgesteld' ) )
+			);
 		} finally {
 			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
-			KnabbelWP\release_story_sync_lock( $post_id );
 		}
+		$this->assert_same( 0, $requests, 'A sync must not talk to Babbel without the lock.' );
+		$this->assert_same( true, $this->sync_lock_exists( $post_id ), 'A live lock must not be taken over.' );
+		$this->assert_same(
+			array( array( 'title' => $title . ' uitgesteld' ) ),
+			get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ),
+			'The deferred change must be stored.'
+		);
+		$this->assert_same(
+			1,
+			$this->action_count( self::DEFERRED_SYNC_HOOK, ActionScheduler_Store::STATUS_PENDING, array( 'post_id' => $post_id ) ),
+			'A deferred sync must be queued.'
+		);
+		$this->assert_recent_error_logged( 'Another Babbel sync of this post is running; deferred this one', 'Deferring a sync must be logged.' );
+
+		// The queued sync takes the deferred change in once the lock is free.
+		$this->delete_sync_lock( $post_id );
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_same( $title . ' uitgesteld', $this->get_babbel_story( $story_id )['title'] ?? null, 'The deferred change must reach Babbel.' );
+		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'A synced deferred change must be removed.' );
+		$this->assert_synced( $post_id, 'A deferred sync must leave nothing pending.' );
+
+		// Releasing never removes a lock that another request took over.
+		$token = KnabbelWP\acquire_story_sync_lock( $post_id );
+		$this->delete_sync_lock( $post_id );
+		$this->insert_sync_lock( $post_id, time() + 60 );
+		KnabbelWP\release_story_sync_lock( $post_id, (string) $token );
+		$this->assert_same( true, $this->sync_lock_exists( $post_id ), 'Release must only remove the caller\'s own lock.' );
+		$this->delete_sync_lock( $post_id );
+
+		// A sync reads the post fresh once it holds the lock, not a copy cached while it waited.
+		global $wpdb;
+		$stale_post = get_post( $post_id );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Changes the stored post behind the cache on purpose.
+		$wpdb->update( $wpdb->posts, array( 'post_title' => $title . ' hersteld' ), array( 'ID' => $post_id ) );
+		wp_cache_set( $post_id, $stale_post, 'posts' );
+		KnabbelWP\sync_story_state( $post_id, $stale_post );
 		$this->assert_same(
 			$title . ' hersteld',
 			$this->get_babbel_story( $story_id )['title'] ?? null,
-			'A sync must not be dropped when the lock stays busy.'
+			'A sync must send the post as stored, not a stale cached copy.'
 		);
-		$this->assert_recent_error_logged( 'Timed out waiting for another Babbel sync of this post; syncing anyway', 'A lock timeout must be logged.' );
 
 		// A second failure while a retry is pending neither schedules nor counts another retry.
 		$this->set_babbel_writes_failing( true );
@@ -1177,10 +1214,22 @@ final class Knabbel_E2E_Suite {
 			$wpdb->options,
 			array(
 				'option_name'  => 'knabbel_sync_lock_' . $post_id,
-				'option_value' => (string) $expires_at,
+				'option_value' => $expires_at . ':e2e-other-request',
 				'autoload'     => 'off',
 			)
 		);
+	}
+
+	/**
+	 * Removes a post's sync lock row, whoever holds it.
+	 *
+	 * @param int $post_id Post ID.
+	 */
+	private function delete_sync_lock( int $post_id ): void {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The lock bypasses the options cache.
+		$wpdb->delete( $wpdb->options, array( 'option_name' => 'knabbel_sync_lock_' . $post_id ) );
 	}
 
 	/**

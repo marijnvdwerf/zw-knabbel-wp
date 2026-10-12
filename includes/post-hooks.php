@@ -20,8 +20,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 const STORY_SYNC_RETRY_HOOK = 'knabbel_retry_story_sync';
 // Delays in seconds before each automatic retry of a failed sync; the count bounds the retries.
 const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
-// Seconds after which a sync lock counts as abandoned; longer than three Babbel requests of 30 seconds.
-const STORY_SYNC_LOCK_TTL = 120;
+// Seconds after which a sync lock counts as abandoned. A sync makes at most two Babbel
+// calls, each with up to two logins and two requests of 30 seconds: 240 seconds.
+const STORY_SYNC_LOCK_TTL      = 600;
+const STORY_SYNC_DEFERRED_HOOK = 'knabbel_deferred_story_sync';
+const STORY_SYNC_DEFERRED_META = '_zw_knabbel_deferred_update';
 
 /**
  * Registers post and metadata hooks.
@@ -37,6 +40,7 @@ function register_post_hooks(): void {
 	add_action( 'deleted_post_meta', __NAMESPACE__ . '\\handle_checkbox_meta_changed', 10, 3 );
 
 	add_action( STORY_SYNC_RETRY_HOOK, __NAMESPACE__ . '\\retry_story_sync', 10, 1 );
+	add_action( STORY_SYNC_DEFERRED_HOOK, __NAMESPACE__ . '\\sync_story_state', 10, 1 );
 }
 
 /**
@@ -91,7 +95,9 @@ function handle_post_saved( int $post_id, \WP_Post $post, bool $update, ?\WP_Pos
  * @param \WP_Post|null $post_before Post state before a save, when available.
  */
 function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
-	with_story_sync_lock( $post_id, static fn () => reconcile_story_state( $post_id, $post_before ) );
+	if ( ! with_story_sync_lock( $post_id, static fn () => reconcile_story_state( $post_id, $post_before ) ) ) {
+		defer_story_sync( $post_id, $post_before );
+	}
 }
 
 /**
@@ -116,10 +122,10 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
 	$active_status  = in_array( $post->post_status, array( 'publish', 'future' ), true );
 	$is_untrash     = null !== $post_before && 'trash' === $post_before->post_status && 'trash' !== $post->post_status;
 	$is_rescheduled = null !== $post_before && 'publish' === $post_before->post_status && 'future' === $post->post_status;
-	// Left publish/future for draft, pending or private; trash is handled separately.
-	$is_deactivated = null !== $post_before
-		&& in_array( $post_before->post_status, array( 'publish', 'future' ), true )
-		&& ! $active_status;
+	// Left publish/future for draft, pending or private; trash is handled separately. Without
+	// the previous post (checkbox events, deferred syncs) any inactive post counts.
+	$is_deactivated = ! $active_status
+		&& ( null === $post_before || in_array( $post_before->post_status, array( 'publish', 'future' ), true ) );
 	// Status changed into publish/future, except the publish→future demotion.
 	$is_activated  = null !== $post_before
 		&& $active_status
@@ -177,29 +183,58 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before ): void {
 		return;
 	}
 
-	$update_data = null;
-	$message     = __( 'Story updated in Babbel', 'zw-knabbel-wp' );
-	$context     = 'pending_update';
-	if ( null !== $post_before ) {
-		if ( $is_rescheduled ) {
-			// An embargo set after publication moves the window to the new publication date.
-			$update_data = build_full_story_update( $post->post_title, $post->post_date );
-			$message     = __( 'Story updated (post rescheduled)', 'zw-knabbel-wp' );
-			$context     = 'publish_to_future';
-		} elseif ( 'publish' === $post->post_status && 'future' === $post_before->post_status ) {
-			$update_data = build_full_story_update( $post->post_title, 'now' );
-			$message     = __( 'Story updated (post published)', 'zw-knabbel-wp' );
-			$context     = 'future_to_publish';
-		} elseif ( $post->post_status === $post_before->post_status ) {
-			$update_data = build_story_update_from_changes( $post, $post_before );
-			$context     = 'publish' === $post->post_status ? 'published_post_edit' : 'scheduled_post_edit';
-		}
+	$change      = null === $post_before ? null : story_update_for_transition( $post, $post_before );
+	$update_data = with_pending_story_update( $state, $post->post_title, $change['data'] ?? null );
+	if ( null !== $update_data ) {
+		push_story_update(
+			$post_id,
+			$story_id,
+			$update_data,
+			$change['message'] ?? __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
+			$change['context'] ?? 'pending_update'
+		);
+	}
+}
+
+/**
+ * Returns the story update a post save calls for.
+ *
+ * @since 0.9.0
+ *
+ * @param \WP_Post $post        Current post.
+ * @param \WP_Post $post_before Post before the save.
+ * @return array{data: array<string, mixed>, message: string, context: string}|null The update, or null when the save changes nothing in Babbel.
+ *
+ * @phpstan-return array{data: StoryUpdateData, message: string, context: string}|null
+ */
+function story_update_for_transition( \WP_Post $post, \WP_Post $post_before ): ?array {
+	if ( 'future' === $post->post_status && 'publish' === $post_before->post_status ) {
+		// An embargo set after publication moves the window to the new publication date.
+		return array(
+			'data'    => build_full_story_update( $post->post_title, $post->post_date ),
+			'message' => __( 'Story updated (post rescheduled)', 'zw-knabbel-wp' ),
+			'context' => 'publish_to_future',
+		);
 	}
 
-	$update_data = with_pending_story_update( $state, $post->post_title, $update_data );
-	if ( null !== $update_data ) {
-		push_story_update( $post_id, $story_id, $update_data, $message, $context );
+	if ( 'publish' === $post->post_status && 'future' === $post_before->post_status ) {
+		return array(
+			'data'    => build_full_story_update( $post->post_title, 'now' ),
+			'message' => __( 'Story updated (post published)', 'zw-knabbel-wp' ),
+			'context' => 'future_to_publish',
+		);
 	}
+
+	$update_data = $post->post_status === $post_before->post_status ? build_story_update_from_changes( $post, $post_before ) : null;
+	if ( null === $update_data ) {
+		return null;
+	}
+
+	return array(
+		'data'    => $update_data,
+		'message' => __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
+		'context' => 'publish' === $post->post_status ? 'published_post_edit' : 'scheduled_post_edit',
+	);
 }
 
 /**
@@ -272,7 +307,9 @@ function with_pending_story_update( array $state, string $title, ?array $update_
  * @param int $post_id Post ID.
  */
 function retry_story_sync( int $post_id ): void {
-	with_story_sync_lock( $post_id, static fn () => run_story_sync_retry( $post_id ) );
+	if ( ! with_story_sync_lock( $post_id, static fn () => run_story_sync_retry( $post_id ) ) ) {
+		defer_story_sync( $post_id, null );
+	}
 }
 
 /**
@@ -324,95 +361,177 @@ function run_story_sync_retry( int $post_id ): void {
  *
  * Syncs and retries of one post read the story state, talk to Babbel and
  * write the result. The lock serializes them across requests, so an older
- * result can never overwrite or clear what a newer sync recorded. A sync
- * that cannot get the lock in time still runs, so a save is never dropped.
+ * result can never overwrite or clear what a newer sync recorded. The post
+ * and its meta are read fresh once the lock is held, and changes that other
+ * requests deferred are taken in first.
  *
  * @since 0.9.0
  *
  * @param int      $post_id  Post ID.
  * @param callable $callback Work to run.
+ * @return bool True when the callback ran, false when the lock stayed busy.
  */
-function with_story_sync_lock( int $post_id, callable $callback ): void {
+function with_story_sync_lock( int $post_id, callable $callback ): bool {
 	static $held = array();
 	if ( isset( $held[ $post_id ] ) ) {
 		$callback();
-		return;
+		return true;
 	}
 
-	$acquired = acquire_story_sync_lock( $post_id );
-	if ( ! $acquired ) {
-		log( 'error', 'PostHooks', 'Timed out waiting for another Babbel sync of this post; syncing anyway', array( 'post_id' => $post_id ) );
+	$token = acquire_story_sync_lock( $post_id );
+	if ( null === $token ) {
+		return false;
 	}
 
 	$held[ $post_id ] = true;
-	// Another request may have changed the state while this one waited.
-	wp_cache_delete( $post_id, 'post_meta' );
 	try {
+		clean_post_cache( $post_id );
+		absorb_deferred_story_updates( $post_id );
 		$callback();
 	} finally {
 		unset( $held[ $post_id ] );
-		if ( $acquired ) {
-			release_story_sync_lock( $post_id );
-		}
+		release_story_sync_lock( $post_id, $token );
 	}
+
+	return true;
 }
 
 /**
  * Takes the post's sync lock, waiting while another request holds it.
  *
- * The lock is an options row: inserting it is atomic, so only one request
- * can hold it. A row past its expiry belongs to a request that died.
+ * The lock is an options row holding its expiry and an owner token. Inserting
+ * it is atomic, so only one request can hold it. A row past its expiry
+ * belongs to a request that died and is replaced.
  *
  * @since 0.9.0
  *
  * @param int $post_id Post ID.
- * @return bool True when the lock was taken.
+ * @return string|null The owner token, or null when the lock stayed busy.
  */
-function acquire_story_sync_lock( int $post_id ): bool {
+function acquire_story_sync_lock( int $post_id ): ?string {
 	global $wpdb;
 
-	$name = 'knabbel_sync_lock_' . $post_id;
+	$name  = 'knabbel_sync_lock_' . $post_id;
+	$token = wp_generate_uuid4();
 	/**
-	 * Filters how long a sync waits for another sync of the same post.
+	 * Filters how long a sync waits for another sync of the same post before it defers itself.
 	 *
 	 * @since 0.9.0
 	 *
 	 * @param int $seconds Maximum wait in seconds.
 	 */
-	$deadline = microtime( true ) + (int) apply_filters( 'knabbel_sync_lock_wait', 60 );
+	$deadline = microtime( true ) + (int) apply_filters( 'knabbel_sync_lock_wait', 10 );
 
 	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- An atomic insert is the lock; the options cache must not answer for it.
 	do {
-		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value < %d", $name, time() ) );
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST( SUBSTRING_INDEX( option_value, ':', 1 ) AS UNSIGNED ) < %d",
+				$name,
+				time()
+			)
+		);
 		$inserted = $wpdb->query(
 			$wpdb->prepare(
 				"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'off')",
 				$name,
-				(string) ( time() + STORY_SYNC_LOCK_TTL )
+				( time() + STORY_SYNC_LOCK_TTL ) . ':' . $token
 			)
 		);
 		if ( 1 === $inserted ) {
-			return true;
+			return $token;
 		}
 		usleep( 250000 );
 	} while ( microtime( true ) < $deadline );
 	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-	return false;
+	return null;
 }
 
 /**
- * Releases the post's sync lock.
+ * Releases the post's sync lock if this request still owns it.
+ *
+ * @since 0.9.0
+ *
+ * @param int    $post_id Post ID.
+ * @param string $token   Owner token from acquire_story_sync_lock().
+ */
+function release_story_sync_lock( int $post_id, string $token ): void {
+	global $wpdb;
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- See acquire_story_sync_lock().
+	$wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$wpdb->options} WHERE option_name = %s AND SUBSTRING_INDEX( option_value, ':', -1 ) = %s",
+			'knabbel_sync_lock_' . $post_id,
+			$token
+		)
+	);
+}
+
+/**
+ * Sets a sync aside for later because another sync of the post is running.
+ *
+ * A save's own change is only known now, from the previous post, so it is
+ * stored as its own meta row: adding a row never overwrites another
+ * request's. A queued sync then takes it in under the lock.
+ *
+ * @since 0.9.0
+ *
+ * @param int           $post_id     Post ID.
+ * @param \WP_Post|null $post_before Post state before a save, when available.
+ */
+function defer_story_sync( int $post_id, ?\WP_Post $post_before ): void {
+	$post   = get_post( $post_id );
+	$change = $post && null !== $post_before ? story_update_for_transition( $post, $post_before ) : null;
+	if ( null !== $change ) {
+		add_post_meta( $post_id, STORY_SYNC_DEFERRED_META, $change['data'] );
+	}
+
+	// A deferred sync that is running and defers again must queue its successor.
+	if ( ! has_pending_story_action( STORY_SYNC_DEFERRED_HOOK, $post_id ) ) {
+		\as_enqueue_async_action( STORY_SYNC_DEFERRED_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' );
+	}
+	log( 'error', 'PostHooks', 'Another Babbel sync of this post is running; deferred this one', array( 'post_id' => $post_id ) );
+}
+
+/**
+ * Takes deferred changes into the pending update.
+ *
+ * Runs under the post's sync lock. Rows are read and deleted one by one, so a
+ * row another request adds meanwhile stays for the next sync.
  *
  * @since 0.9.0
  *
  * @param int $post_id Post ID.
  */
-function release_story_sync_lock( int $post_id ): void {
+function absorb_deferred_story_updates( int $post_id ): void {
 	global $wpdb;
 
-	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- See acquire_story_sync_lock().
-	$wpdb->delete( $wpdb->options, array( 'option_name' => 'knabbel_sync_lock_' . $post_id ) );
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Rows must be read with their IDs, in insertion order.
+	$rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id",
+			$post_id,
+			STORY_SYNC_DEFERRED_META
+		)
+	);
+	if ( array() === $rows ) {
+		return;
+	}
+
+	$state   = get_story_state( $post_id );
+	$pending = array();
+	foreach ( $rows as $row ) {
+		$fields  = get_pending_story_update( array( 'pending_update' => maybe_unserialize( $row->meta_value ) ) );
+		$pending = array_merge( $pending, $fields ?? array() );
+		delete_metadata_by_mid( 'post', (int) $row->meta_id );
+	}
+
+	$merged = array_merge( get_pending_story_update( $state ) ?? array(), $pending );
+	if ( array() !== $merged ) {
+		update_story_state( $post_id, array( 'pending_update' => $merged ) );
+	}
 }
 
 /**
@@ -423,19 +542,8 @@ function release_story_sync_lock( int $post_id ): void {
  * @param int $post_id Post ID.
  */
 function schedule_story_sync_retry( int $post_id ): void {
-	$args = array( 'post_id' => $post_id );
 	// Only a pending retry counts: a retry that is running right now schedules its successor.
-	$pending = \as_get_scheduled_actions(
-		array(
-			'hook'     => STORY_SYNC_RETRY_HOOK,
-			'args'     => $args,
-			'group'    => 'zw-knabbel-wp',
-			'status'   => \ActionScheduler_Store::STATUS_PENDING,
-			'per_page' => 1,
-		),
-		'ids'
-	);
-	if ( array() !== $pending ) {
+	if ( has_pending_story_action( STORY_SYNC_RETRY_HOOK, $post_id ) ) {
 		return;
 	}
 
@@ -445,11 +553,43 @@ function schedule_story_sync_retry( int $post_id ): void {
 		return;
 	}
 
-	if ( ! \as_schedule_single_action( time() + STORY_SYNC_RETRY_DELAYS[ $attempts ], STORY_SYNC_RETRY_HOOK, $args, 'zw-knabbel-wp' ) ) {
+	$scheduled = \as_schedule_single_action(
+		time() + STORY_SYNC_RETRY_DELAYS[ $attempts ],
+		STORY_SYNC_RETRY_HOOK,
+		array( 'post_id' => $post_id ),
+		'zw-knabbel-wp'
+	);
+	if ( ! $scheduled ) {
 		log( 'error', 'PostHooks', 'Could not schedule a Babbel sync retry', array( 'post_id' => $post_id ) );
 		return;
 	}
 	update_story_state( $post_id, array( 'sync_retry_attempts' => $attempts + 1 ) );
+}
+
+/**
+ * Reports whether a post has a pending action for a hook.
+ *
+ * Unlike as_has_scheduled_action(), a running action does not count.
+ *
+ * @since 0.9.0
+ *
+ * @param string $hook    Action hook.
+ * @param int    $post_id Post ID.
+ * @return bool True when an action waits to run.
+ */
+function has_pending_story_action( string $hook, int $post_id ): bool {
+	$pending = \as_get_scheduled_actions(
+		array(
+			'hook'     => $hook,
+			'args'     => array( 'post_id' => $post_id ),
+			'group'    => 'zw-knabbel-wp',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 1,
+		),
+		'ids'
+	);
+
+	return array() !== $pending;
 }
 
 /**

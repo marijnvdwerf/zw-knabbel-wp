@@ -1,7 +1,9 @@
+import type { Page } from '@playwright/test';
 import { expect, test } from './fixtures';
 import {
     BABBEL_ADMIN,
     babbelStoryStatus,
+    clickToSavePost,
     controlStory,
     currentPostID,
     disposeBabbelContext,
@@ -138,7 +140,7 @@ test.describe
             // An unsaved edit must survive the retry button.
             const retriedTitle = `${originalTitle} opnieuw`;
             await page.locator('#title').fill(retriedTitle);
-            await savePost(page, '.knabbel-sync-retry');
+            await clickToSavePost(page, '.knabbel-sync-retry');
 
             await expect(page.locator('#title')).toHaveValue(retriedTitle);
             await expect(page.locator('#original_post_status')).toHaveValue(
@@ -151,6 +153,55 @@ test.describe
                 page.locator('.knabbel-status-badge.sent'),
             ).toBeVisible();
             expect((await getBabbelStory(storyID)).title).toBe(retriedTitle);
+
+            // A date-only edit must survive the retry button and move the window.
+            await failOneTitleSave(page, postID, `${retriedTitle} mislukt`);
+            await page.locator('a.edit-timestamp').click();
+            const date = new Date(
+                Date.UTC(
+                    Number(await page.locator('#aa').inputValue()),
+                    Number(await page.locator('#mm').inputValue()) - 1,
+                    Number(await page.locator('#jj').inputValue()) - 3,
+                ),
+            );
+            await page.locator('#aa').fill(String(date.getUTCFullYear()));
+            await page
+                .locator('#mm')
+                .selectOption(String(date.getUTCMonth() + 1).padStart(2, '0'));
+            await page.locator('#jj').fill(String(date.getUTCDate()));
+            await page.locator('a.save-timestamp').click();
+            await clickToSavePost(page, '.knabbel-sync-retry');
+
+            await expect(page.locator('#original_post_status')).toHaveValue(
+                'publish',
+            );
+            await expect(page.locator('#hidden_jj')).toHaveValue(
+                String(date.getUTCDate()).padStart(2, '0'),
+            );
+            date.setUTCDate(date.getUTCDate() + 1);
+            const story = await getBabbelStory(storyID);
+            expect(story.start_date?.slice(0, 10)).toBe(
+                date.toISOString().slice(0, 10),
+            );
+            await expect(
+                page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
+            ).toHaveCount(0);
+
+            // A checkbox edit must survive the retry button.
+            await failOneTitleSave(
+                page,
+                postID,
+                `${retriedTitle} weer mislukt`,
+            );
+            await setBabbelEnabled(page, false);
+            await clickToSavePost(page, '.knabbel-sync-retry');
+            await expect(
+                page.locator('#knabbel_send_to_babbel'),
+            ).not.toBeChecked();
+            await expect(
+                page.locator('.knabbel-status-badge.deleted'),
+            ).toBeVisible();
+            expect(await babbelStoryStatus(storyID)).toBe(404);
         });
 
         test('redacteur schakelt Babbel uit en herstelt daarna hetzelfde verhaal', async ({
@@ -175,3 +226,23 @@ test.describe
             await getBabbelStory(storyID);
         });
     });
+
+/**
+ * Save a title edit while Babbel writes fail, so the sync warning appears.
+ */
+async function failOneTitleSave(
+    page: Page,
+    postID: number,
+    title: string,
+): Promise<void> {
+    await controlStory(page, postID, 'fail_writes');
+    try {
+        await page.locator('#title').fill(title);
+        await savePost(page);
+    } finally {
+        await controlStory(page, postID, 'restore_writes');
+    }
+    await expect(
+        page.locator('.misc-pub-knabbel .knabbel-sync-warning'),
+    ).toBeVisible();
+}

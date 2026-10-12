@@ -113,3 +113,17 @@ if ( ! class_exists( 'ActionScheduler_Store' ) ) {
 		public const STATUS_PENDING = 'pending';
 	}
 }
+
+if ( ! function_exists( 'as_enqueue_async_action' ) ) {
+	/**
+	 * Stubs an async action.
+	 *
+	 * @param string $hook  The hook to trigger.
+	 * @param array  $args  Arguments to pass to the hook.
+	 * @param string $group The group to assign this job to.
+	 * @return int The action ID, or 0 on failure.
+	 */
+	function as_enqueue_async_action( string $hook, array $args = array(), string $group = '' ): int {
+		return 0;
+	}
+}

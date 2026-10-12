@@ -572,6 +572,7 @@ function deactivate(): void {
 	// args or a group forces an exact args match and would skip per-post actions.
 	\as_unschedule_all_actions( 'knabbel_process_story' );
 	\as_unschedule_all_actions( 'knabbel_retry_story_sync' );
+	\as_unschedule_all_actions( 'knabbel_deferred_story_sync' );
 
 	// Clear few-shot sync schedule and cached data.
 	few_shot_unschedule_sync();
