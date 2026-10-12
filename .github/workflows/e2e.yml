@@ -45,7 +45,7 @@ jobs:
             babbel_ref: 771f47a5a77911ec84d1cfa7c78e029ee73430d3
           # Repeats a create with the same idempotency key safely (oszuidwest/zwfm-babbel#343).
           - name: WordPress to Babbel (idempotent create)
-            babbel_ref: 10d899b5230b83ffc0afcf2dacaee201c0ada1de
+            babbel_ref: b1157d2e1b58c8faec740c0158cd204ddf1fff60
 
     steps:
       - name: Checkout plugin
