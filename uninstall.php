@@ -24,8 +24,7 @@ delete_option( 'knabbel_migration_status_changed_at' );
 delete_option( 'knabbel_few_shot_examples' );
 delete_option( 'knabbel_version' );
 
-// Remove deferred sync changes and sync locks left by requests that died while holding them.
-delete_post_meta_by_key( '_zw_knabbel_deferred_update' );
+// Remove sync locks left by requests that died while holding them.
 global $wpdb;
 // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- One-time cleanup of uncached lock rows.
 $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'knabbel_sync_lock_' ) . '%' ) );

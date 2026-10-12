@@ -629,7 +629,8 @@ function ajax_test_api(): void {
  * @since 0.1.0
  * @since 0.7.0 Excludes the current post from the AI few-shot examples.
  * @since 0.8.0 Accepts only a post ID and leaves already sent stories untouched.
- * @since 0.9.0 Skips posts that are no longer published, scheduled or enabled, also after generation.
+ * @since 0.9.0 Skips posts that are no longer published, scheduled or enabled, also after generation, and
+ *              records what Babbel confirmed.
  * @param int $post_id The WordPress post ID.
  */
 function process_story_async( int $post_id ): void {
@@ -726,7 +727,7 @@ function process_story_async( int $post_id ): void {
 	// Calculate dates based on post status:
 	// - For scheduled posts (future): use the scheduled publish time (post_date).
 	// - For published posts: use current time.
-	$base_date = 'future' === $post->post_status ? $post->post_date : 'now';
+	$base_date = 'future' === $post->post_status ? $post->post_date : current_time( 'mysql' );
 	$dates     = calculate_story_dates( $base_date );
 
 	$story_data = array(
@@ -754,6 +755,15 @@ function process_story_async( int $post_id ): void {
 				'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
 				'generated_speech_text' => $speech_text,
 				'last_sync_error'       => null,
+				// What Babbel confirmed, and the window base a published story keeps.
+				'synced'                => array(
+					'title'      => $title,
+					'start_date' => $dates['start_date'],
+					'end_date'   => $dates['end_date'],
+					'weekdays'   => $dates['weekdays'],
+				),
+				'window_base'           => 'future' === $post->post_status ? null : $base_date,
+				'post_date_seen'        => $post->post_date,
 			)
 		);
 	} else {
