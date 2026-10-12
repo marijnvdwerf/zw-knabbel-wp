@@ -321,7 +321,8 @@ function update_story_state( int $post_id, array $updates = array() ): bool {
 		}
 	}
 
-	$success = update_post_meta( $post_id, '_zw_knabbel_story_state', $new_state );
+	// Post meta is stored unslashed, so the state is slashed to keep backslashes in titles and texts.
+	$success = update_post_meta( $post_id, '_zw_knabbel_story_state', wp_slash( $new_state ) );
 
 	if ( $success ) {
 		/**

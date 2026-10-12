@@ -25,8 +25,8 @@ const STORY_SYNC_RETRY_DELAYS = array( 300, 1800, 7200, 21600 );
 // again), each with up to two logins and two requests of 30 seconds: 1080 seconds.
 const STORY_SYNC_LOCK_TTL      = 1500;
 const STORY_SYNC_DEFERRED_HOOK = 'knabbel_deferred_story_sync';
-// Seconds after which a create whose answer was lost can no longer commit in Babbel; until then, a
-// lookup that finds nothing keeps the attempt pending.
+// Seconds after which a create whose answer was lost is assumed to no longer commit in Babbel, which
+// sets no deadline; until then, a lookup that finds nothing keeps the attempt pending.
 const PENDING_CREATE_SETTLE_SECONDS = 900;
 // Post meta for an editor's request to restore a story deleted in Babbel, until a sync takes it over.
 const RESTORE_REQUEST_META_KEY = '_zw_knabbel_restore_request';
@@ -1113,7 +1113,7 @@ function story_create_in_flight( int $post_id, ?bool $flying = null ): bool {
  * token the attempt sent in its metadata and, when found, adopted as the
  * post's story,
  * so the post never gets a second one and the first does not stay behind with
- * an old window. When Babbel has none once the attempt can no longer commit,
+ * an old window. When Babbel has none once the attempt is assumed to no longer commit,
  * nothing was created and a new attempt may follow; until then, and when the
  * lookup fails, the attempt stays pending and is retried.
  *
@@ -1133,25 +1133,27 @@ function resolve_pending_create( int $post_id ): ?bool {
 	if ( isset( $pending['request'] ) ) {
 		$replay = babbel_create_story( $pending['request'] );
 		if ( $replay['success'] ) {
-			return adopt_created_story( $post_id, $pending, (string) $replay['story_id'] );
-		}
-		if ( empty( $replay['unsupported'] ) ) {
-			// Babbel reads the key before it validates, so a rejected body means no story has the key.
-			if ( in_array( $replay['status_code'] ?? 0, array( 400, 422 ), true ) ) {
-				update_story_state( $post_id, array( 'pending_create' => null ) );
-				return false;
+			// The repeat names the story; reading it tells whether it was deleted in Babbel since.
+			$found = babbel_find_story( (string) $replay['story_id'] );
+			if ( $found['success'] && 'missing' !== ( $found['found'] ?? '' ) ) {
+				return adopt_created_story( $post_id, $pending, (string) $replay['story_id'], (array) ( $found['story'] ?? array() ) );
 			}
-			update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $replay['message'], 'create' ) ) );
-			schedule_story_sync_retry( $post_id );
-			schedule_story_sync_at( $post_id, time() + HOUR_IN_SECONDS );
-			return null;
+			$replay = array_merge( $found, array( 'message' => $found['success'] ? __( 'Invalid API response', 'zw-knabbel-wp' ) : $found['message'] ) );
+		} elseif ( ! empty( $replay['unsupported'] ) || in_array( $replay['status_code'] ?? 0, array( 400, 422 ), true ) ) {
+			// Babbel validates the body before it reads the key, so a rejected repeat proves nothing
+			// about the first create: the attempt is looked up by its token instead.
+			unset( $pending['request'] );
+			update_story_state( $post_id, array( 'pending_create' => $pending ) );
+			return resolve_pending_create( $post_id );
 		}
-		// Babbel no longer takes the key: the attempt is looked up by its token instead.
-		unset( $pending['request'] );
-		update_story_state( $post_id, array( 'pending_create' => $pending ) );
+		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $replay['message'], 'create' ) ) );
+		schedule_story_sync_retry( $post_id );
+		schedule_story_sync_at( $post_id, time() + HOUR_IN_SECONDS );
+		return null;
 	}
 
-	// Only a lookup that starts once the attempt can no longer commit can prove there is no story.
+	// Only a lookup that starts once the attempt is assumed to no longer commit counts as proof that
+	// there is no story.
 	$settled = time() >= $pending['since'] + PENDING_CREATE_SETTLE_SECONDS;
 	// Ten minutes of margin on each side cover a clock difference between WordPress and Babbel.
 	$found = babbel_find_created_story( $pending['id'], $pending['since'] - 600, $pending['since'] + PENDING_CREATE_SETTLE_SECONDS + 600 );
@@ -1215,6 +1217,8 @@ function adopt_created_story( int $post_id, array $pending, string $story_id, ar
 			'generated_speech_text' => $pending['speech_text'],
 			'last_sync_error'       => null,
 			'pending_create'        => null,
+			// The sync that brings the adopted story in line gets a full retry budget.
+			'sync_retry_attempts'   => null,
 			// Without readable fields, the next comparison reads the story first.
 			'synced'                => story_fields_from_babbel( $story ),
 			'window_base'           => $pending['window_base'],
