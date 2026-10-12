@@ -951,7 +951,7 @@ final class Knabbel_E2E_Suite {
 		$snapshot = array();
 		foreach ( $names as $name ) {
 			$value             = get_option( $name, $missing );
-			$snapshot[ $name ] = array( $missing !== $value, $missing === $value ? null : $value );
+			$snapshot[ $name ] = array( $missing !== $value, $value );
 		}
 
 		return $snapshot;
