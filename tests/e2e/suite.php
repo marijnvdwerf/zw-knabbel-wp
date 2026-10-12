@@ -2637,19 +2637,7 @@ final class Knabbel_E2E_Suite {
 		$other_id  = 0;
 		$interject = function ( $preempt, array $args, string $url ) use ( $post_id, $title, $token, $dates, &$other_id ) {
 			if ( 0 === $other_id && 'https://api.openai.com/v1/responses' === $url ) {
-				$made     = $this->babbel_request(
-					'POST',
-					'/stories',
-					array(
-						'title'      => $title,
-						'text'       => 'Gemaakt door een andere worker.',
-						'start_date' => $dates['start_date'],
-						'end_date'   => $dates['end_date'],
-						'weekdays'   => 127,
-						'metadata'   => array( 'knabbel_create_id' => $token ),
-					)
-				);
-				$other_id = (int) ( json_decode( wp_remote_retrieve_body( $made ), true )['id'] ?? -1 );
+				$other_id = (int) ( $this->create_babbel_story_with_token( $title, 'Gemaakt door een andere worker.', $token, $dates ) ?? -1 );
 				KnabbelWP\update_story_state(
 					$post_id,
 					array(
@@ -2683,19 +2671,7 @@ final class Knabbel_E2E_Suite {
 		// An attempt already pending when a worker starts is settled first, under the lock.
 		$title   = 'E2E aanmaken door een eerdere worker';
 		$token   = wp_generate_uuid4();
-		$made    = $this->babbel_request(
-			'POST',
-			'/stories',
-			array(
-				'title'      => $title,
-				'text'       => 'Gemaakt door een eerdere worker.',
-				'start_date' => $dates['start_date'],
-				'end_date'   => $dates['end_date'],
-				'weekdays'   => 127,
-				'metadata'   => array( 'knabbel_create_id' => $token ),
-			)
-		);
-		$made_id = (string) ( json_decode( wp_remote_retrieve_body( $made ), true )['id'] ?? '' );
+		$made_id = (string) ( $this->create_babbel_story_with_token( $title, 'Gemaakt door een eerdere worker.', $token, $dates ) ?? '' );
 		$post_id = $this->create_enabled_draft( $title, 'Een eerdere worker maakte het verhaal al.' );
 		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
 		KnabbelWP\update_story_state(
@@ -3793,6 +3769,32 @@ final class Knabbel_E2E_Suite {
 		}
 
 		return $response;
+	}
+
+	/**
+	 * Creates a story through the independent test client, as a create attempt with a token would.
+	 *
+	 * @param string                $title Story title.
+	 * @param string                $text  Story text.
+	 * @param string                $token The attempt's token, sent as `knabbel_create_id`.
+	 * @param array<string, string> $dates Start and end date of the story.
+	 * @return mixed The new story's ID, or null when Babbel returned none.
+	 */
+	private function create_babbel_story_with_token( string $title, string $text, string $token, array $dates ): mixed {
+		$response = $this->babbel_request(
+			'POST',
+			'/stories',
+			array(
+				'title'      => $title,
+				'text'       => $text,
+				'start_date' => $dates['start_date'],
+				'end_date'   => $dates['end_date'],
+				'weekdays'   => 127,
+				'metadata'   => array( 'knabbel_create_id' => $token ),
+			)
+		);
+
+		return json_decode( wp_remote_retrieve_body( $response ), true )['id'] ?? null;
 	}
 
 	/**

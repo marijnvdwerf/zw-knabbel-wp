@@ -1121,20 +1121,21 @@ function resolve_pending_create( int $post_id ): ?bool {
 		return false;
 	}
 
+	$story_id = (string) $story['id'];
 	log(
 		'info',
 		'PostHooks',
 		'Adopting the story an unanswered create made',
 		array(
 			'post_id'  => $post_id,
-			'story_id' => (string) $story['id'],
+			'story_id' => $story_id,
 		)
 	);
 	update_story_state(
 		$post_id,
 		array(
 			'status'                => StoryStatus::Sent->value,
-			'story_id'              => (string) $story['id'],
+			'story_id'              => $story_id,
 			'message'               => __( 'Story created successfully', 'zw-knabbel-wp' ),
 			'generated_speech_text' => $pending['speech_text'],
 			'last_sync_error'       => null,
@@ -1146,7 +1147,7 @@ function resolve_pending_create( int $post_id ): ?bool {
 	);
 	// Deleted in Babbel since it was made: that deletion was made outside WordPress (#93).
 	if ( ! empty( $story['deleted_at'] ) ) {
-		record_story_gone( $post_id, (string) $story['id'], 'story.deleted', 'The created story was deleted in Babbel' );
+		record_story_gone( $post_id, $story_id, 'story.deleted', 'The created story was deleted in Babbel' );
 	}
 	return true;
 }

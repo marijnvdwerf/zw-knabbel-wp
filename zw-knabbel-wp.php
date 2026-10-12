@@ -696,20 +696,13 @@ function process_story_async( int $post_id ): void {
  * @return \WP_Post|null The post to generate a story for, or null when there is nothing to do.
  */
 function prepare_story_processing( int $post_id ): ?\WP_Post {
+	// A create whose answer was lost may have made the story: settle that before anything else.
+	if ( settle_pending_create( $post_id ) ) {
+		return null;
+	}
+
 	// Send-once safety: a post that has a story, even one gone from Babbel, never gets another.
 	$existing_state = get_story_state( $post_id );
-	// A create whose answer was lost may have made the story: settle that before anything else.
-	if ( ! empty( $existing_state['pending_create'] ) ) {
-		$adopted = resolve_pending_create( $post_id );
-		if ( null === $adopted ) {
-			return null;
-		}
-		if ( $adopted ) {
-			sync_story_state( $post_id );
-			return null;
-		}
-		$existing_state = get_story_state( $post_id );
-	}
 	if ( story_exists_for_post( $existing_state ) ) {
 		log( 'info', 'CronProcessor', 'Story already sent — skipping', array( 'post_id' => $post_id ) );
 		return null;
@@ -773,15 +766,8 @@ function prepare_story_processing( int $post_id ): ?\WP_Post {
 function send_generated_story( int $post_id, ?string $speech_text ): void {
 	// Another worker may have made an attempt during generation whose answer was lost: settle it
 	// first, so this one neither replaces its token nor makes a second story.
-	if ( ! empty( get_story_state( $post_id )['pending_create'] ) ) {
-		$adopted = resolve_pending_create( $post_id );
-		if ( null === $adopted ) {
-			return;
-		}
-		if ( $adopted ) {
-			sync_story_state( $post_id );
-			return;
-		}
+	if ( settle_pending_create( $post_id ) ) {
+		return;
 	}
 
 	// Generation takes a while: another request may have given the post a story meanwhile, and
@@ -895,18 +881,37 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 		sync_story_state( $post_id );
 		return;
 	}
-	update_story_state(
-		$post_id,
-		array_merge(
-			array(
-				'status'  => \KnabbelWP\StoryStatus::Error->value,
-				'message' => $result['message'],
-			),
-			// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
-			null === $adopted ? array() : array(
-				'last_sync_error' => build_story_sync_error( $result['message'], 'create' ),
-				'pending_create'  => null,
-			)
-		)
+	$error_state = array(
+		'status'  => \KnabbelWP\StoryStatus::Error->value,
+		'message' => $result['message'],
 	);
+	// A failed lookup keeps the attempt pending and its own error; it is looked up again first.
+	if ( null !== $adopted ) {
+		$error_state['last_sync_error'] = build_story_sync_error( $result['message'], 'create' );
+		$error_state['pending_create']  = null;
+	}
+	update_story_state( $post_id, $error_state );
+}
+
+/**
+ * Settles a create attempt still pending before a worker goes on.
+ *
+ * Runs while holding the post's sync lock. A story the attempt made is
+ * adopted and brought in line with the post.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id The WordPress post ID.
+ * @return bool True when the worker stops: the story was adopted, or the lookup failed and is retried.
+ */
+function settle_pending_create( int $post_id ): bool {
+	if ( empty( get_story_state( $post_id )['pending_create'] ) ) {
+		return false;
+	}
+
+	$adopted = resolve_pending_create( $post_id );
+	if ( true === $adopted ) {
+		sync_story_state( $post_id );
+	}
+	return false !== $adopted;
 }
