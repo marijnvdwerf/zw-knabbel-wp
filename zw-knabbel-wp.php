@@ -834,7 +834,7 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 	$story_data['metadata']['knabbel_create_id'] = $create_id;
 	story_create_in_flight( $post_id, true );
 	try {
-		update_story_state(
+		$recorded = update_story_state(
 			$post_id,
 			array(
 				'pending_create' => array(
@@ -845,9 +845,20 @@ function send_generated_story( int $post_id, ?string $speech_text ): void {
 				),
 			)
 		);
-		$result = babbel_create_story( $story_data );
+		// An attempt that could not be recorded could never be found again if its answer were lost.
+		$result = $recorded ? babbel_create_story( $story_data ) : null;
 	} finally {
 		story_create_in_flight( $post_id, false );
+	}
+	if ( null === $result ) {
+		update_story_state(
+			$post_id,
+			array(
+				'status'  => \KnabbelWP\StoryStatus::Error->value,
+				'message' => __( 'Could not record the create attempt; the story was not sent', 'zw-knabbel-wp' ),
+			)
+		);
+		return;
 	}
 
 	if ( $result['success'] ) {

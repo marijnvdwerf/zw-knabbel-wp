@@ -2,7 +2,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: ZuidWest Knabbel 0.8.0\n"
 "Report-Msgid-Bugs-To: https://wordpress.org/support/plugin/zw-knabbel-wp\n"
-"POT-Creation-Date: 2026-10-12T17:17:49+00:00\n"
+"POT-Creation-Date: 2026-10-12T17:31:03+00:00\n"
 "PO-Revision-Date: 2026-08-11T14:51:44+00:00\n"
 "Last-Translator: Remon Mens\n"
 "Language-Team: Dutch\n"
@@ -365,7 +365,7 @@ msgstr "API-verbinding mislukt: "
 #: includes/babbel-api.php:780 includes/babbel-api.php:863
 #: includes/babbel-api.php:927 includes/babbel-api.php:1016
 #: includes/babbel-api.php:1021 includes/post-hooks.php:428
-#: includes/post-hooks.php:877
+#: includes/post-hooks.php:890
 msgid "Invalid API response"
 msgstr "Ongeldige API-respons"
 
@@ -373,8 +373,8 @@ msgstr "Ongeldige API-respons"
 msgid "No story ID received from API"
 msgstr "Geen verhaal-ID ontvangen van API"
 
-#: includes/babbel-api.php:358 includes/post-hooks.php:1154
-#: zw-knabbel-wp.php:859
+#: includes/babbel-api.php:358 includes/post-hooks.php:1172
+#: zw-knabbel-wp.php:870
 msgid "Story created successfully"
 msgstr "Verhaal succesvol aangemaakt"
 
@@ -450,11 +450,11 @@ msgstr "Verhaal bijgewerkt (bericht opnieuw ingepland)"
 msgid "Story updated (post published)"
 msgstr "Verhaal bijgewerkt (bericht gepubliceerd)"
 
-#: includes/post-hooks.php:255 includes/post-hooks.php:994
+#: includes/post-hooks.php:255 includes/post-hooks.php:1007
 msgid "Story updated in Babbel"
 msgstr "Verhaal bijgewerkt in Babbel"
 
-#: includes/post-hooks.php:574
+#: includes/post-hooks.php:587
 msgid ""
 "This story was deleted in Babbel outside WordPress. Restore it to bring it "
 "back with its audio and bulletin history."
@@ -462,7 +462,7 @@ msgstr ""
 "Dit verhaal is buiten WordPress in Babbel verwijderd. Herstel het om het "
 "terug te halen met audio en bulletingeschiedenis."
 
-#: includes/post-hooks.php:580
+#: includes/post-hooks.php:593
 msgid ""
 "This story no longer exists in Babbel and is not created again "
 "automatically. Disable and enable Radio News to create a new one."
@@ -470,15 +470,15 @@ msgstr ""
 "Dit verhaal bestaat niet meer in Babbel en wordt niet vanzelf opnieuw "
 "gemaakt. Zet Radionieuws uit en weer aan om een nieuw verhaal te maken."
 
-#: includes/post-hooks.php:978 includes/post-hooks.php:1025
+#: includes/post-hooks.php:991 includes/post-hooks.php:1038
 msgid "Could not read the deleted story from Babbel"
 msgstr "Kon het verwijderde verhaal niet uit Babbel lezen"
 
-#: includes/post-hooks.php:1009
+#: includes/post-hooks.php:1022
 msgid "Could not restore the story in Babbel"
 msgstr "Kon het verhaal niet herstellen in Babbel"
 
-#: includes/post-hooks.php:1043
+#: includes/post-hooks.php:1056
 msgid ""
 "Restoring now could let the story into a bulletin with its old dates; it is "
 "restored once that is safe"
@@ -486,36 +486,36 @@ msgstr ""
 "Nu herstellen zou het verhaal met zijn oude datums in een bulletin kunnen "
 "brengen; het wordt hersteld zodra dat veilig is"
 
-#: includes/post-hooks.php:1130
+#: includes/post-hooks.php:1147
 msgid "Waiting to see whether Babbel created the story"
 msgstr "Wachten tot duidelijk is of Babbel het verhaal heeft gemaakt"
 
-#: includes/post-hooks.php:1221 includes/post-hooks.php:1233
-#: includes/post-hooks.php:1288 includes/post-hooks.php:1311
+#: includes/post-hooks.php:1239 includes/post-hooks.php:1251
+#: includes/post-hooks.php:1306 includes/post-hooks.php:1329
 msgid "Story restored in Babbel"
 msgstr "Verhaal hersteld in Babbel"
 
-#: includes/post-hooks.php:1322
+#: includes/post-hooks.php:1340
 msgid "Could not read the restored story from Babbel"
 msgstr "Kon het herstelde verhaal niet uit Babbel lezen"
 
-#: includes/post-hooks.php:1338
+#: includes/post-hooks.php:1356
 msgid "Story could not be updated after restoring and was deleted again"
 msgstr "Verhaal kon na herstel niet worden bijgewerkt en is weer verwijderd"
 
-#: includes/post-hooks.php:1351
+#: includes/post-hooks.php:1369
 msgid "Story restored in Babbel, but updating it failed"
 msgstr "Verhaal hersteld in Babbel, maar bijwerken is mislukt"
 
-#: includes/post-hooks.php:1583
+#: includes/post-hooks.php:1601
 msgid "Processing already scheduled"
 msgstr "Verwerking al ingepland"
 
-#: includes/post-hooks.php:1602
+#: includes/post-hooks.php:1620
 msgid "Processing scheduled"
 msgstr "Verwerking ingepland"
 
-#: includes/post-hooks.php:1610
+#: includes/post-hooks.php:1628
 msgid "Could not schedule action"
 msgstr "Kon actie niet inplannen"
 
@@ -562,6 +562,10 @@ msgstr "Verzenden naar Babbel is uitgeschakeld voor dit bericht"
 #: zw-knabbel-wp.php:786
 msgid "Could not generate speech text"
 msgstr "Kon spreektekst niet genereren"
+
+#: zw-knabbel-wp.php:858
+msgid "Could not record the create attempt; the story was not sent"
+msgstr "Kon de poging om het verhaal te maken niet vastleggen; het verhaal is niet verstuurd"
 
 #~ msgid "Connection successful"
 #~ msgstr "Verbinding succesvol"

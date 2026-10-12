@@ -2777,6 +2777,45 @@ final class Knabbel_E2E_Suite {
 		$this->assert_story_status( $post_id, StoryStatus::Sent, 'A create that committed late must be adopted.' );
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title ), 'No second story may appear.' );
 
+		// A pending attempt is followed up even when the retries have run out.
+		$title   = 'E2E aanmaken zonder antwoord na alle pogingen';
+		$post_id = $this->create_enabled_draft( $title, 'De automatische pogingen zijn al op.' );
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		KnabbelWP\update_story_state( $post_id, array( 'sync_retry_attempts' => count( KnabbelWP\STORY_SYNC_RETRY_DELAYS ) ) );
+		add_filter( 'pre_http_request', $no_reach, 1, 3 );
+		try {
+			$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) );
+		} finally {
+			remove_filter( 'pre_http_request', $no_reach, 1 );
+		}
+		$since = (int) ( KnabbelWP\get_story_state( $post_id )['pending_create']['since'] ?? 0 );
+		$next  = as_next_scheduled_action( self::SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), self::ACTION_GROUP );
+		$this->assert_same(
+			true,
+			is_int( $next ) && $next >= $since + KnabbelWP\PENDING_CREATE_SETTLE_SECONDS,
+			'A pending attempt must be looked up again once it can no longer commit, outside the retry limit.'
+		);
+
+		// An attempt that cannot be recorded is not sent, so no story can be made that nothing would find.
+		$title     = 'E2E aanmaken zonder vastgelegde poging';
+		$post_id   = $this->create_enabled_draft( $title, 'De poging kan niet worden vastgelegd.' );
+		$no_record = static function ( $check, $object_id, $meta_key, $meta_value ) use ( $post_id ) {
+			if ( $post_id === (int) $object_id && '_zw_knabbel_story_state' === $meta_key && isset( $meta_value['pending_create'] ) ) {
+				return false;
+			}
+			return $check;
+		};
+		$this->update_post( $post_id, array( 'post_status' => 'publish' ) );
+		add_filter( 'update_post_metadata', $no_record, 10, 4 );
+		try {
+			$requests = $this->count_babbel_requests( fn () => $this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $post_id ) ) );
+		} finally {
+			remove_filter( 'update_post_metadata', $no_record, 10 );
+		}
+		$this->assert_same( 0, $requests, 'An unrecorded attempt must not reach Babbel.' );
+		$this->assert_story_status( $post_id, StoryStatus::Error, 'An unrecorded attempt must end in an error.' );
+		$this->assert_same( 0, $this->count_babbel_stories_by_title( $title ), 'No story may be made.' );
+
 		// Nothing was ever made: once the attempt can no longer commit, the next run creates the story.
 		$title   = 'E2E aanmaken zonder verhaal';
 		$post_id = $this->create_enabled_draft( $title, 'Het verzoek komt nooit aan bij Babbel.' );

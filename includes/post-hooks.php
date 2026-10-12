@@ -525,13 +525,26 @@ function story_window_covers( array $fields, \DateTimeImmutable $day ): bool {
  * @param int $post_id Post ID.
  */
 function schedule_story_sync_at_next_day( int $post_id ): void {
+	schedule_story_sync_at( $post_id, ( new \DateTimeImmutable( 'tomorrow', wp_timezone() ) )->modify( '+5 minutes' )->getTimestamp() );
+}
+
+/**
+ * Schedules a sync at a given time, unless one is already pending.
+ *
+ * This does not count as an automatic retry.
+ *
+ * @since 0.9.0
+ *
+ * @param int $post_id   Post ID.
+ * @param int $timestamp Unix time to sync at.
+ */
+function schedule_story_sync_at( int $post_id, int $timestamp ): void {
 	if ( has_pending_story_action( STORY_SYNC_RETRY_HOOK, $post_id ) ) {
 		return;
 	}
 
-	$next_day = ( new \DateTimeImmutable( 'tomorrow', wp_timezone() ) )->modify( '+5 minutes' );
-	if ( ! \as_schedule_single_action( $next_day->getTimestamp(), STORY_SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' ) ) {
-		log( 'error', 'PostHooks', 'Could not schedule a Babbel sync for the next day', array( 'post_id' => $post_id ) );
+	if ( ! \as_schedule_single_action( $timestamp, STORY_SYNC_RETRY_HOOK, array( 'post_id' => $post_id ), 'zw-knabbel-wp' ) ) {
+		log( 'error', 'PostHooks', 'Could not schedule a Babbel sync', array( 'post_id' => $post_id ) );
 	}
 }
 
@@ -1112,11 +1125,15 @@ function resolve_pending_create( int $post_id ): ?bool {
 		return false;
 	}
 
+	// Only a lookup that starts once the attempt can no longer commit can prove there is no story.
+	$settled = time() >= $pending['since'] + PENDING_CREATE_SETTLE_SECONDS;
 	// Ten minutes of margin on each side cover a clock difference between WordPress and Babbel.
 	$found = babbel_find_created_story( $pending['id'], $pending['since'] - 600, $pending['since'] + PENDING_CREATE_SETTLE_SECONDS + 600 );
 	if ( ! $found['success'] ) {
 		update_story_state( $post_id, array( 'last_sync_error' => build_story_sync_error( $found['message'], 'create' ) ) );
 		schedule_story_sync_retry( $post_id );
+		// A pending attempt is never left without a follow-up, even once the retries run out.
+		schedule_story_sync_at( $post_id, time() + HOUR_IN_SECONDS );
 		return null;
 	}
 
@@ -1124,12 +1141,13 @@ function resolve_pending_create( int $post_id ): ?bool {
 	if ( ! is_array( $story ) || ! is_scalar( $story['id'] ?? null ) ) {
 		// A create whose answer was lost may still commit afterwards; until it is old enough, finding
 		// nothing proves nothing, so the attempt stays pending and is looked up again.
-		if ( time() < $pending['since'] + PENDING_CREATE_SETTLE_SECONDS ) {
+		if ( ! $settled ) {
 			update_story_state(
 				$post_id,
 				array( 'last_sync_error' => build_story_sync_error( __( 'Waiting to see whether Babbel created the story', 'zw-knabbel-wp' ), 'create' ) )
 			);
-			schedule_story_sync_retry( $post_id );
+			// Outside the retry limit: this look is due whatever the retries did before.
+			schedule_story_sync_at( $post_id, max( time(), $pending['since'] + PENDING_CREATE_SETTLE_SECONDS ) + 60 );
 			return null;
 		}
 		update_story_state( $post_id, array( 'pending_create' => null ) );
