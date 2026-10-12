@@ -53,6 +53,13 @@ final class Knabbel_E2E_Suite {
 	private int $case_count = 0;
 
 	/**
+	 * HTTP methods whose Babbel story requests currently fail.
+	 *
+	 * @var array<int, string>
+	 */
+	private array $failing_babbel_methods = array();
+
+	/**
 	 * WordPress ID of the shared published fixture.
 	 *
 	 * @var int
@@ -1024,9 +1031,14 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( 0, $requests, 'A sync must not talk to Babbel without the lock.' );
 		$this->assert_same( true, $this->sync_lock_exists( $post_id ), 'A live lock must not be taken over.' );
 		$this->assert_same(
-			array( array( 'window' => false ) ),
+			array(
+				array(
+					'window'   => '',
+					'modified' => get_post_field( 'post_modified_gmt', $post_id ),
+				),
+			),
 			get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ),
-			'The deferred change must be stored without values.'
+			'The deferred change must be stored without values, with its post version.'
 		);
 		$this->assert_same(
 			1,
@@ -1042,12 +1054,63 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'A synced deferred change must be removed.' );
 		$this->assert_synced( $post_id, 'A deferred sync must leave nothing pending.' );
 
-		// A deferred change from an older save sends the post as it is now, not its own older values.
+		// A deferred publication from an older post version cannot replace a newer date with a `now` window.
 		$newer_date = $this->past_post_date( 2 );
-		add_post_meta( $post_id, '_zw_knabbel_deferred_update', array( 'window' => true ) );
 		$this->set_post_date( $post_id, $newer_date );
-		$this->assert_story_window( $story_id, $newer_date, 'Absorbing an older deferred change must keep the newest date.' );
+		add_post_meta(
+			$post_id,
+			'_zw_knabbel_deferred_update',
+			array(
+				'window'   => 'now',
+				'modified' => '2000-01-01 00:00:00',
+			)
+		);
+		KnabbelWP\retry_story_sync( $post_id );
+		$this->assert_story_window( $story_id, $newer_date, 'An obsolete deferred publication must keep the newest date.' );
 		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'Absorbed rows must be removed.' );
+
+		// A save whose post version was superseded while it waited sends the post as it is now.
+		$superseded_before                   = get_post( $post_id );
+		$superseded_before->post_status      = 'future';
+		$superseded_saved                    = clone get_post( $post_id );
+		$superseded_saved->post_modified_gmt = '2000-01-01 00:00:00';
+		KnabbelWP\sync_story_state( $post_id, $superseded_before, $superseded_saved );
+		$this->assert_story_window( $story_id, $newer_date, 'A superseded publication must not replace a newer date with a now window.' );
+		$current_saved = clone get_post( $post_id );
+		$dates_before  = KnabbelWP\calculate_story_dates( 'now' );
+		KnabbelWP\sync_story_state( $post_id, $superseded_before, $current_saved );
+		$dates_after = KnabbelWP\calculate_story_dates( 'now' );
+		$this->assert_story_dates_in_window(
+			$this->get_babbel_story( $story_id ),
+			$dates_before,
+			$dates_after,
+			'A current publication must still use a now window.'
+		);
+		$reset_date = $this->past_post_date( 4 );
+		$this->set_post_date( $post_id, $reset_date );
+		$this->assert_story_window( $story_id, $reset_date, 'Precondition: the window must follow the post date again.' );
+
+		// Deferred rows stay when the pending update cannot be stored.
+		add_post_meta(
+			$post_id,
+			'_zw_knabbel_deferred_update',
+			array(
+				'window'   => 'post_date',
+				'modified' => '',
+			)
+		);
+		$block_state = static fn ( $check, $object_id, $meta_key ) => '_zw_knabbel_story_state' === $meta_key ? false : $check;
+		add_filter( 'update_post_metadata', $block_state, 10, 3 );
+		try {
+			KnabbelWP\retry_story_sync( $post_id );
+		} finally {
+			remove_filter( 'update_post_metadata', $block_state, 10 );
+		}
+		$this->assert_same( 1, count( get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ) ), 'Rows must stay when storing them failed.' );
+		$this->assert_recent_error_logged( 'Could not store deferred Babbel changes; keeping them for the next sync', 'A failed store must be logged.' );
+		KnabbelWP\retry_story_sync( $post_id );
+		$this->assert_same( array(), get_post_meta( $post_id, '_zw_knabbel_deferred_update', false ), 'The next sync must take the rows in.' );
+		$this->assert_synced( $post_id, 'The next sync must send the kept rows.' );
 
 		// A deferred sync that finds the lock busy again queues its successor.
 		$this->insert_sync_lock( $post_id, time() + 60 );
@@ -1091,6 +1154,45 @@ final class Knabbel_E2E_Suite {
 		);
 		$this->update_post( $post_id, array() );
 		$this->assert_same( $title . ' niet ingepland', $this->get_babbel_story( $story_id )['title'] ?? null, 'The next save must sync the change.' );
+
+		// A retry that has to defer keeps its intent: a legacy error is still resent afterwards.
+		$this->babbel_request(
+			'PUT',
+			'/stories/' . $story_id,
+			array(
+				'start_date' => '2030-01-01',
+				'end_date'   => '2030-01-02',
+			)
+		);
+		KnabbelWP\update_story_state( $post_id, array( 'last_sync_error' => KnabbelWP\build_story_sync_error( 'E2E: an earlier version failed', 'update' ) ) );
+		$this->insert_sync_lock( $post_id, time() + 60 );
+		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+		try {
+			KnabbelWP\retry_story_sync( $post_id );
+		} finally {
+			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+			$this->delete_sync_lock( $post_id );
+		}
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $post_id ) );
+		$this->assert_story_window( $story_id, (string) get_post_field( 'post_date', $post_id ), 'A deferred retry must still resend a legacy error.' );
+		$this->assert_synced( $post_id, 'A deferred retry must clear the legacy error.' );
+
+		// A restore keeps pending fields when its update fails.
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 0 );
+		$this->assert_story_status( $post_id, StoryStatus::Deleted, 'Precondition: disabling must delete the story.' );
+		$pending_dates = KnabbelWP\calculate_story_dates( $this->past_post_date( 1 ) );
+		KnabbelWP\update_story_state( $post_id, array( 'pending_update' => $pending_dates ) );
+		$this->set_failing_babbel_methods( array( 'PUT' ) );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 1 );
+		$this->set_failing_babbel_methods( array() );
+		$state = KnabbelWP\get_story_state( $post_id );
+		$this->assert_same(
+			array( $pending_dates['start_date'], $pending_dates['end_date'] ),
+			array( $state['pending_update']['start_date'] ?? null, $state['pending_update']['end_date'] ?? null ),
+			'A failed restore update must keep the pending dates.'
+		);
+		$this->update_post( $post_id, array() );
+		$this->assert_synced( $post_id, 'Precondition: the story must be in sync.' );
 
 		// Releasing never removes a lock that another request took over.
 		$token = KnabbelWP\acquire_story_sync_lock( $post_id );
@@ -1203,6 +1305,46 @@ final class Knabbel_E2E_Suite {
 		$this->assert_same( 1, $this->count_babbel_stories_by_title( $title . ' hersteld' ), 'Retries must never create another story.' );
 		$this->assert_same( 0, $this->story_action_count( $post_id ), 'Retries must never queue story generation.' );
 		$this->assert_same( $ai_calls, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Retries must never generate speech text.' );
+
+		// A late scheduled publication that had to wait keeps its `now` window, as without waiting.
+		$late_title = 'E2E late publicatie';
+		$late_id    = $this->create_enabled_draft(
+			$late_title,
+			'Een geplande publicatie die te laat door cron wordt uitgevoerd moet bij uitstel hetzelfde venster krijgen.'
+		);
+		$this->schedule_post( $late_id, $this->future_post_date( 2 ) );
+		$this->run_action_scheduler( self::STORY_HOOK, 1, array( 'post_id' => $late_id ) );
+		$late_story_id = (string) ( KnabbelWP\get_story_state( $late_id )['story_id'] ?? '' );
+		global $wpdb;
+		$overdue = $this->past_post_date( 1 );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Makes the scheduled date overdue, as a late cron run finds it.
+		$wpdb->update(
+			$wpdb->posts,
+			array(
+				'post_date'     => $overdue,
+				'post_date_gmt' => get_gmt_from_date( $overdue ),
+			),
+			array( 'ID' => $late_id )
+		);
+		clean_post_cache( $late_id );
+		$this->insert_sync_lock( $late_id, time() + 60 );
+		add_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+		try {
+			wp_publish_post( $late_id );
+		} finally {
+			remove_filter( 'knabbel_sync_lock_wait', '__return_zero' );
+			$this->delete_sync_lock( $late_id );
+		}
+		$this->assert_same( 'publish', get_post_status( $late_id ), 'Precondition: the post must be published.' );
+		$dates_before = KnabbelWP\calculate_story_dates( 'now' );
+		$this->run_action_scheduler( self::DEFERRED_SYNC_HOOK, 1, array( 'post_id' => $late_id ) );
+		$dates_after = KnabbelWP\calculate_story_dates( 'now' );
+		$this->assert_story_dates_in_window(
+			$this->get_babbel_story( $late_story_id ),
+			$dates_before,
+			$dates_after,
+			'A deferred late publication must use a now window.'
+		);
 	}
 
 	/**
@@ -1214,8 +1356,18 @@ final class Knabbel_E2E_Suite {
 	 * @param bool $failing Whether writes must fail.
 	 */
 	private function set_babbel_writes_failing( bool $failing ): void {
+		$this->set_failing_babbel_methods( $failing ? array( 'PUT', 'PATCH', 'DELETE' ) : array() );
+	}
+
+	/**
+	 * Makes story requests with the given methods fail at the HTTP layer.
+	 *
+	 * @param array<int, string> $methods HTTP methods that must fail; empty to stop failing.
+	 */
+	private function set_failing_babbel_methods( array $methods ): void {
+		$this->failing_babbel_methods = $methods;
 		remove_filter( 'pre_http_request', array( $this, 'fail_babbel_write' ), 1 );
-		if ( $failing ) {
+		if ( array() !== $methods ) {
 			add_filter( 'pre_http_request', array( $this, 'fail_babbel_write' ), 1, 3 );
 		}
 	}
@@ -1230,7 +1382,7 @@ final class Knabbel_E2E_Suite {
 	 */
 	public function fail_babbel_write( false|array|WP_Error $preempt, array $args, string $url ): false|array|WP_Error {
 		$method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
-		if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories' ) && in_array( $method, array( 'PUT', 'PATCH', 'DELETE' ), true ) ) {
+		if ( str_starts_with( $url, self::BABBEL_BASE_URL . '/stories' ) && in_array( $method, $this->failing_babbel_methods, true ) ) {
 			return new WP_Error( 'http_request_failed', 'E2E: Babbel is unreachable' );
 		}
 

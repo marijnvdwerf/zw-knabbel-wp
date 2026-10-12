@@ -78,7 +78,7 @@ function handle_checkbox_meta_changed( $meta_id, $post_id, $meta_key ): void {
  * @param \WP_Post|null $post_before Post object before the update, or null for new posts.
  */
 function handle_post_saved( int $post_id, \WP_Post $post, bool $update, ?\WP_Post $post_before ): void {
-	sync_story_state( $post_id, $post_before );
+	sync_story_state( $post_id, $post_before, $post );
 }
 
 /**
@@ -93,9 +93,10 @@ function handle_post_saved( int $post_id, \WP_Post $post, bool $update, ?\WP_Pos
  *
  * @param int           $post_id     Post ID.
  * @param \WP_Post|null $post_before Post state before a save, when available.
+ * @param \WP_Post|null $post_saved  Post as this save stored it, when available.
  */
-function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
-	if ( ! with_story_sync_lock( $post_id, static fn () => reconcile_story_state( $post_id, $post_before ) ) ) {
+function sync_story_state( int $post_id, ?\WP_Post $post_before = null, ?\WP_Post $post_saved = null ): void {
+	if ( ! with_story_sync_lock( $post_id, static fn () => reconcile_story_state( $post_id, $post_before, false, $post_saved ) ) ) {
 		defer_story_sync( $post_id, $post_before );
 	}
 }
@@ -106,14 +107,21 @@ function sync_story_state( int $post_id, ?\WP_Post $post_before = null ): void {
  * Without the previous post, it works from the current post and story state
  * alone. A retry also resends an update error that predates pending fields.
  *
+ * A save that waited for the lock may find that a newer save changed the post
+ * meanwhile. Its transition is then obsolete: replaying it, such as a `now`
+ * window for a publication, could overwrite the newer save. Such a save sends
+ * the post as it is now: the title, and if it moved the window, the window
+ * based on the post date.
+ *
  * @since 0.9.0
  *
  * @param int           $post_id     Post ID.
  * @param \WP_Post|null $post_before Post state before a save, when available.
  * @param bool          $retry       Whether this retries a failed sync.
+ * @param \WP_Post|null $post_saved  Post as the save stored it, when available.
  * @return bool True when Babbel was written to.
  */
-function reconcile_story_state( int $post_id, ?\WP_Post $post_before, bool $retry = false ): bool {
+function reconcile_story_state( int $post_id, ?\WP_Post $post_before, bool $retry = false, ?\WP_Post $post_saved = null ): bool {
 	$post = get_post( $post_id );
 	// Revisions and autosaves have post type 'revision', so this also excludes them.
 	if ( ! $post || 'post' !== $post->post_type ) {
@@ -189,7 +197,16 @@ function reconcile_story_state( int $post_id, ?\WP_Post $post_before, bool $retr
 		return false;
 	}
 
-	$change      = null === $post_before ? null : story_update_for_transition( $post, $post_before );
+	$change = null === $post_before ? null : story_update_for_transition( $post, $post_before );
+	if ( null !== $change && null !== $post_saved && $post_saved->post_modified_gmt !== $post->post_modified_gmt ) {
+		$moves_window = '' !== $change['window'];
+		$change       = array(
+			'data'    => $moves_window ? build_full_story_update( $post->post_title, $post->post_date ) : array( 'title' => $post->post_title ),
+			'window'  => $moves_window ? 'post_date' : '',
+			'message' => __( 'Story updated in Babbel', 'zw-knabbel-wp' ),
+			'context' => 'superseded_save',
+		);
+	}
 	$update_data = with_pending_story_update( $state, $post->post_title, $change['data'] ?? null );
 	$error       = get_story_sync_error( $state );
 	if ( null === $update_data && $retry && in_array( $error['operation'] ?? '', array( 'update', 'restore' ), true ) ) {
@@ -468,9 +485,9 @@ function release_story_sync_lock( int $post_id, string $token ): void {
  *
  * A save's own change is only known now, from the previous post, so what
  * changed is stored as its own meta row: adding a row never overwrites
- * another request's. The row holds no values, only whether the window moved;
- * the queued sync computes the values from the post as it is then, so the
- * order in which rows arrive cannot matter.
+ * another request's. The row holds no values, only the base of a moved window
+ * and the post version it came from; the queued sync computes the values from
+ * the post as it is then, so the order in which rows arrive cannot matter.
  *
  * @since 0.9.0
  *
@@ -481,7 +498,14 @@ function defer_story_sync( int $post_id, ?\WP_Post $post_before ): void {
 	$post   = get_post( $post_id );
 	$change = $post && null !== $post_before ? story_update_for_transition( $post, $post_before ) : null;
 	if ( null !== $change ) {
-		add_post_meta( $post_id, STORY_SYNC_DEFERRED_META, array( 'window' => '' !== $change['window'] ) );
+		add_post_meta(
+			$post_id,
+			STORY_SYNC_DEFERRED_META,
+			array(
+				'window'   => $change['window'],
+				'modified' => $post->post_modified_gmt,
+			)
+		);
 	}
 
 	log( 'error', 'PostHooks', 'Another Babbel sync of this post is running; deferred this one', array( 'post_id' => $post_id ) );
@@ -520,14 +544,22 @@ function absorb_deferred_story_updates( int $post_id ): void {
 		return;
 	}
 
-	// Values come from the post as it is now; a row only says whether the window moved. The
-	// window then follows the post date, which for a publication equals its publication time.
-	$deferred = array( 'title' => $post->post_title );
+	// Values come from the post as it is now; a row only says how the window moved. A `now`
+	// base counts only from the save that stored the current post; an older one is obsolete.
+	$window = '';
 	foreach ( $rows as $row ) {
-		if ( ! empty( maybe_unserialize( $row->meta_value )['window'] ) ) {
-			$deferred = build_full_story_update( $post->post_title, $post->post_date );
+		$deferred_change = maybe_unserialize( $row->meta_value );
+		$row_window      = is_array( $deferred_change ) && is_string( $deferred_change['window'] ?? null ) ? $deferred_change['window'] : '';
+		$is_current      = is_array( $deferred_change ) && ( $deferred_change['modified'] ?? null ) === $post->post_modified_gmt;
+		if ( 'now' === $row_window && $is_current ) {
+			$window = 'now';
+		} elseif ( '' !== $row_window && 'now' !== $window ) {
+			$window = 'post_date';
 		}
 	}
+	$deferred = '' === $window
+		? array( 'title' => $post->post_title )
+		: build_full_story_update( $post->post_title, 'now' === $window ? 'now' : $post->post_date );
 
 	$merged = array_merge( get_pending_story_update( get_story_state( $post_id ) ) ?? array(), $deferred );
 	update_story_state( $post_id, array( 'pending_update' => $merged ) );
