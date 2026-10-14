@@ -851,7 +851,8 @@ final class Knabbel_E2E_Suite {
 	 * Verifies the default prompt's year and form rules.
 	 */
 	private function test_default_prompt_constraints(): void {
-		$timezone = get_option( 'timezone_string' );
+		// The snapshot also restores whether the option existed at all.
+		$timezone = $this->snapshot_options( array( 'timezone_string' ) );
 		// 31 December 2026 11:00 UTC is already 2027 at UTC+14 and still 2026 at UTC-11.
 		$timestamp = gmmktime( 11, 0, 0, 12, 31, 2026 );
 		try {
@@ -868,7 +869,7 @@ final class Knabbel_E2E_Suite {
 				'The year must follow the site timezone behind UTC.'
 			);
 		} finally {
-			update_option( 'timezone_string', $timezone );
+			$this->restore_options( $timezone );
 		}
 		$this->assert_same( false, str_contains( KnabbelWP\ai_default_instruction(), '{year}' ), 'The year placeholder must always be replaced.' );
 
@@ -922,6 +923,23 @@ final class Knabbel_E2E_Suite {
 				),
 				'Every rejected attempt and the fallback must record their reasons.'
 			);
+
+			// Empty output and provider failures neither replace nor drop a nonconforming text.
+			delete_option( 'knabbel_recent_errors' );
+			update_option( 'knabbel_e2e_ai_outputs', array( $too_long, '', null ), false );
+			update_option( 'knabbel_e2e_ai_call_count', 0, false );
+			$this->assert_same(
+				$too_long,
+				KnabbelWP\ai_generate_content( 'Een artikel met lege en mislukte pogingen.', 0 ),
+				'A nonconforming text must survive later empty or failed attempts.'
+			);
+			$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Empty and failed attempts must be retried.' );
+
+			// Without any generated text, generation fails.
+			update_option( 'knabbel_e2e_ai_outputs', array( null, '', null ), false );
+			update_option( 'knabbel_e2e_ai_call_count', 0, false );
+			$this->assert_same( null, KnabbelWP\ai_generate_content( 'Een artikel zonder tekst.', 0 ), 'Without any text, generation must fail.' );
+			$this->assert_same( 3, (int) get_option( 'knabbel_e2e_ai_call_count', 0 ), 'Every attempt must be used.' );
 
 			$custom_output                    = $too_long . "\n\nTweede alinea van het eigen bericht.";
 			$custom_settings                  = $settings;

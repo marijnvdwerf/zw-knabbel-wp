@@ -50,12 +50,16 @@ add_filter(
 				return new WP_Error( 'knabbel_e2e_ai_error', 'Deterministic AI provider failure' );
 			}
 
-			// Queued outputs are answered in order before the default text.
+			// Queued outputs are answered in order before the default text; a queued null is a failure.
 			$queued_outputs = get_option( 'knabbel_e2e_ai_outputs', array() );
 			$text           = 'Deterministische E2E-radiospreektekst.'; // Keep in sync with suite.php and editor-flow.spec.ts.
 			if ( is_array( $queued_outputs ) && array() !== $queued_outputs ) {
-				$text = (string) array_shift( $queued_outputs );
+				$queued = array_shift( $queued_outputs );
 				update_option( 'knabbel_e2e_ai_outputs', $queued_outputs, false );
+				if ( null === $queued ) {
+					return new WP_Error( 'knabbel_e2e_ai_error', 'Queued AI provider failure' );
+				}
+				$text = (string) $queued;
 			}
 
 			$body = array(
