@@ -38,7 +38,7 @@ npm run lint
 shellcheck tests/e2e/run.sh
 ```
 
-Run the isolated WordPress 7.0.2 and Babbel regression suite with:
+Run the isolated WordPress 7.1 and Babbel regression suite with:
 
 ```bash
 BABBEL_PATH=../zwfm-babbel tests/e2e/run.sh
