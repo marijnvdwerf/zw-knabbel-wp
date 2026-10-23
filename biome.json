@@ -20,7 +20,7 @@
             "quoteStyle": "single",
             "semicolons": "always"
         },
-        "globals": ["ajaxurl", "knabbel_admin"]
+        "globals": ["ajaxurl", "knabbel_admin", "knabbel_editor", "wp"]
     },
     "css": {
         "formatter": {

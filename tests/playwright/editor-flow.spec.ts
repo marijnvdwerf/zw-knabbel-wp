@@ -6,6 +6,8 @@ import {
     currentPostID,
     disposeBabbelContext,
     getBabbelStory,
+    openBlockEditor,
+    saveBlockEditorPost,
     savePost,
     setBabbelEnabled,
 } from './utils';
@@ -138,6 +140,33 @@ test.describe
                 page.locator('.knabbel-status-badge.sent'),
             ).toBeVisible();
 
+            await getBabbelStory(storyID);
+        });
+        test('redacteur schakelt Radionieuws in de blokeditor uit en weer in', async ({
+            page,
+        }) => {
+            await openBlockEditor(page, postID);
+
+            const toggle = page.getByRole('checkbox', { name: 'Radio News' });
+            await expect(toggle).toBeChecked();
+            await expect(page.locator('.knabbel-sync-status')).toHaveText(
+                'Status: Sent',
+            );
+
+            await toggle.uncheck();
+            const disableRequest = await saveBlockEditorPost(page);
+            // The editor sends the changed key, not a copy of all post meta.
+            // Core adds its own footnotes key to every post save.
+            expect(disableRequest.meta).toMatchObject({
+                _zw_knabbel_send_to_babbel: false,
+            });
+            expect(await babbelStoryStatus(storyID)).toBe(404);
+
+            await openBlockEditor(page, postID);
+            await expect(toggle).not.toBeChecked();
+
+            await toggle.check();
+            await saveBlockEditorPost(page);
             await getBabbelStory(storyID);
         });
     });

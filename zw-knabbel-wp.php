@@ -478,6 +478,10 @@ function init(): void {
 	require_once KNABBEL_PLUGIN_DIR . 'includes/post-hooks.php';
 	register_post_hooks();
 
+	// Block editor support: meta registration, status REST field and editor script.
+	require_once KNABBEL_PLUGIN_DIR . 'includes/block-editor.php';
+	block_editor_init();
+
 	if ( is_admin() ) {
 		admin_init();
 	}

@@ -6,6 +6,19 @@ import {
     request,
 } from '@playwright/test';
 
+interface WPData {
+    select(store: string): unknown;
+    dispatch(store: string): {
+        set(scope: string, name: string, value: unknown): void;
+    };
+}
+
+declare global {
+    interface Window {
+        wp?: { data?: WPData };
+    }
+}
+
 export interface StoryState {
     status?: string;
     story_id?: string;
@@ -103,6 +116,57 @@ export async function savePost(page: Page): Promise<void> {
     await expectResponseOk(response, 'Post save failed.');
     await expect(page).toHaveURL(/\/wp-admin\/post\.php\?post=\d+&action=edit/);
     await expect(page.locator('#publish')).toBeVisible();
+}
+
+/**
+ * Open a post in the block editor, which the E2E MU plugin otherwise disables.
+ */
+export async function openBlockEditor(
+    page: Page,
+    postID: number,
+): Promise<void> {
+    await page.goto(
+        `/wp-admin/post.php?post=${postID}&action=edit&knabbel_e2e_editor=block`,
+    );
+    await page.waitForFunction(() => window.wp?.data?.select('core/editor'));
+    // Keep the Welcome Guide out of the way and make sure the Summary is visible.
+    await page.evaluate(() => {
+        const dispatch = window.wp?.data?.dispatch;
+        if (!dispatch) {
+            throw new Error('The block editor did not load.');
+        }
+        dispatch('core/preferences').set(
+            'core/edit-post',
+            'welcomeGuide',
+            false,
+        );
+        dispatch('core/preferences').set(
+            'core/edit-post',
+            'fullscreenMode',
+            false,
+        );
+    });
+    await expect(page.locator('.knabbel-post-status')).toBeVisible();
+}
+
+/**
+ * Save the block editor post and return the JSON body of the REST request.
+ */
+export async function saveBlockEditorPost(
+    page: Page,
+): Promise<{ meta?: Record<string, unknown> }> {
+    const saveResponse = page.waitForResponse(
+        (response) =>
+            response.request().method() === 'POST' &&
+            /\/wp-json\/wp\/v2\/posts\/\d+|rest_route=%2Fwp%2Fv2%2Fposts%2F\d+/.test(
+                response.url(),
+            ),
+    );
+    await page.getByRole('button', { name: /^(Save|Update)$/ }).click();
+    const response = await saveResponse;
+    await expectResponseOk(response, 'Block editor save failed.');
+
+    return response.request().postDataJSON();
 }
 
 export function currentPostID(page: Page): number {

@@ -31,7 +31,7 @@ project, removes it after the run, and writes combined container logs to
 
 ## Covered scenarios
 
-The scenario catalog (E2E-001 through E2E-020) lives in the `run()` method of
+The scenario catalog (E2E-001 through E2E-021) lives in the `run()` method of
 `suite.php`; the runner prints each scenario ID and title during execution.
 
 Before the PHP scenarios, Playwright drives the real WordPress admin UI in
@@ -39,7 +39,8 @@ Chromium. The browser coverage saves and tests plugin settings, publishes a
 post, and disables and restores Babbel synchronization. Lifecycle edge cases
 remain in the faster PHP scenarios instead of repeating WordPress-owned editor
 flows in the browser. The browser suite uses the classic WordPress post editor
-to keep the plugin-owned metabox flow deterministic. The PHP and browser suites
+to keep the plugin-owned metabox flow deterministic, plus one scenario that opens
+a post in the block editor through the `knabbel_e2e_editor=block` URL switch. The PHP and browser suites
 share test-only editor and queue controls loaded as an MU plugin.
 
 The runner invokes `npm run test:e2e:browser` with the discovered WordPress and

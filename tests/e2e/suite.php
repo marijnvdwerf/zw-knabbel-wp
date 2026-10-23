@@ -88,6 +88,7 @@ final class Knabbel_E2E_Suite {
 		$this->run_case( 'E2E-018', 'stored Unix timestamps retain their meaning after serialization', $this->test_stored_datetime_formatting( ... ) );
 		$this->run_case( 'E2E-019', 'a story deleted in Babbel reports a readable 410 on update', $this->test_story_deleted_in_babbel( ... ) );
 		$this->run_case( 'E2E-020', 'deactivation clears sessions, caches and scheduled actions', $this->test_deactivation_cleanup( ... ) );
+		$this->run_case( 'E2E-021', 'block editor REST contract for the checkbox and sync status', $this->test_block_editor_rest_contract( ... ) );
 
 		WP_CLI::success( sprintf( '%d E2E scenarios passed with %d assertions.', $this->case_count, $this->assertion_count ) );
 	}
@@ -573,6 +574,77 @@ final class Knabbel_E2E_Suite {
 		);
 
 		$this->configure_plugin();
+	}
+
+	/**
+	 * Verifies the REST contract the block editor relies on.
+	 */
+	private function test_block_editor_rest_contract(): void {
+		$admin_id = (int) get_users(
+			array(
+				'role'   => 'administrator',
+				'number' => 1,
+				'fields' => 'ID',
+			)
+		)[0];
+		wp_set_current_user( $admin_id );
+		$post_id = $this->create_draft( 'E2E REST contract', 'REST schrijft het vinkje en leest de status.' );
+		$route   = '/wp/v2/posts/' . $post_id;
+
+		$request = new WP_REST_Request( 'POST', $route );
+		$request->set_body_params( array( 'meta' => array( self::SEND_TO_BABBEL_META_KEY => true ) ) );
+		$response = rest_do_request( $request );
+		$this->assert_same( 200, $response->get_status(), 'Writing the checkbox through REST must succeed.' );
+		$this->assert_same( '1', get_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, true ), 'REST must store the same value as the submit box.' );
+
+		$request = new WP_REST_Request( 'POST', $route );
+		$request->set_body_params( array( 'meta' => array( self::SEND_TO_BABBEL_META_KEY => false ) ) );
+		rest_do_request( $request );
+		$this->assert_same( '0', get_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, true ), 'Disabling through REST must store 0.' );
+
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, '0' );
+		update_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, 'true' );
+		$this->assert_same( '1', get_post_meta( $post_id, self::SEND_TO_BABBEL_META_KEY, true ), 'String values from WP-CLI must be normalized.' );
+
+		$request = new WP_REST_Request( 'GET', $route );
+		$request->set_query_params( array( 'context' => 'view' ) );
+		$data = rest_do_request( $request )->get_data();
+		$this->assert_same( false, isset( $data['meta'][ self::SEND_TO_BABBEL_META_KEY ] ), 'The view context must not expose the checkbox.' );
+		$this->assert_same( false, isset( $data['knabbel_status'] ), 'The view context must not expose the sync status.' );
+
+		$request = new WP_REST_Request( 'GET', $route );
+		$request->set_query_params( array( 'context' => 'edit' ) );
+		$data = rest_do_request( $request )->get_data();
+		$this->assert_same( true, $data['meta'][ self::SEND_TO_BABBEL_META_KEY ] ?? null, 'The edit context must expose the checkbox as a boolean.' );
+		$no_story = array_key_exists( 'knabbel_status', $data ) && null === $data['knabbel_status'];
+		$this->assert_same( true, $no_story, 'Posts without a story have a null status.' );
+
+		update_post_meta(
+			$post_id,
+			'_zw_knabbel_story_state',
+			array(
+				'status'          => StoryStatus::Error->value,
+				'last_sync_error' => KnabbelWP\build_story_sync_error( 'Babbel is niet bereikbaar', 'create' ),
+			)
+		);
+		$data = rest_do_request( $request )->get_data();
+		$this->assert_same( StoryStatus::Error->value, $data['knabbel_status']['status'] ?? null, 'The edit context must expose the story status.' );
+		$this->assert_same( 'Babbel is niet bereikbaar', $data['knabbel_status']['error_message'] ?? null, 'The edit context must expose the sync error.' );
+
+		$subscriber_id = wp_insert_user(
+			array(
+				'user_login' => 'e2e-subscriber',
+				'user_pass'  => wp_generate_password(),
+				'role'       => 'subscriber',
+			)
+		);
+		wp_set_current_user( (int) $subscriber_id );
+		$can_write = current_user_can( 'edit_post_meta', $post_id, self::SEND_TO_BABBEL_META_KEY );
+		$this->assert_same( false, $can_write, 'Users who cannot edit the post cannot write it.' );
+		$this->assert_same( null, KnabbelWP\get_editor_status( $post_id ), 'Users who cannot edit the post must not read the sync status.' );
+
+		wp_set_current_user( 0 );
+		wp_delete_user( (int) $subscriber_id );
 	}
 
 	/**

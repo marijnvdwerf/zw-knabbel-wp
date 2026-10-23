@@ -4,7 +4,7 @@ Publishes selected WordPress posts as radio stories in the [Babbel API](https://
 
 ## What it does
 
-- adds a native **Radionieuws** control to the Publish box in the Classic Editor
+- adds a native **Radionieuws** control to the Publish box in the Classic Editor, and a toggle with the Babbel sync status to the Summary panel of the block editor
 - generates provider-independent speech text through the WordPress AI Client
 - creates, updates, deletes, and restores the matching Babbel story
 - refreshes a nightly pool of Babbel examples from the last three months, then selects eight per AI request: three directly accepted and five editor-adjusted texts when available
@@ -15,7 +15,7 @@ Publishes selected WordPress posts as radio stories in the [Babbel API](https://
 
 - WordPress 7.0+
 - PHP 8.3 or 8.4
-- The [Classic Editor](https://wordpress.org/plugins/classic-editor/) plugin, installed and activated; the block editor is not supported
+- The [Classic Editor](https://wordpress.org/plugins/classic-editor/) plugin, installed and activated. Posts that open in the block editor get the Radionieuws toggle in the Summary panel
 - A compatible AI provider configured under **Settings > Connectors**
 - A running instance of the [Babbel API](https://github.com/oszuidwest/zwfm-babbel) v0.17.0 or later
 

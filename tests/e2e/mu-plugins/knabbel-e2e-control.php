@@ -16,13 +16,19 @@ if ( ! function_exists( 'wp_get_environment_type' ) || 'local' !== wp_get_enviro
 	return;
 }
 
-// The browser suite exercises the plugin's classic metabox integration.
-add_filter(
-	'use_block_editor_for_post_type',
-	static fn( bool $use_block_editor, string $post_type ): bool => 'post' === $post_type ? false : $use_block_editor,
-	10,
-	2
-);
+// The browser suite exercises the classic metabox integration by default. Appending
+// knabbel_e2e_editor=block to a post.php URL opens that page in the block editor instead.
+// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Test-only switch, local environments only.
+if ( isset( $_GET['knabbel_e2e_editor'] ) && 'block' === $_GET['knabbel_e2e_editor'] ) {
+	add_filter( 'pre_option_classic-editor-replace', static fn(): string => 'block' );
+} else {
+	add_filter(
+		'use_block_editor_for_post_type',
+		static fn( bool $use_block_editor, string $post_type ): bool => 'post' === $post_type ? false : $use_block_editor,
+		10,
+		2
+	);
+}
 
 /**
  * Runs due actions and fails on errors.
